@@ -159,13 +159,14 @@ def build_summary(wb, df):
 
 # ── BOLTZMANN SCATTER ─────────────────────────────────────────────────────────
 
-def build_boltzmann(wb, df):
+def build_boltzmann(wb, df, temp_map=None):
     """
     Native scatter mirroring the matplotlib Boltzmann plot:
-    x-axis is Temperature (°C), each condition is a cluster at its
-    TEMP_AXIS_MAP position with a small run-number-based jitter so overlapping
-    points spread visually.
+    x-axis is Temperature (°C), each condition is a cluster at its temperature
+    position with a small run-number-based jitter so overlapping points spread.
+    temp_map overrides TEMP_AXIS_MAP for the x positions.
     """
+    tmap = temp_map or TEMP_AXIS_MAP
     ws = wb.create_sheet("BOLTZMANN")
     ws["A1"] = "Boltzmann Scatter — Value by Temperature Condition"
     ws["A1"].font = hfont(size=13, color=HEADER_FILL)
@@ -173,7 +174,7 @@ def build_boltzmann(wb, df):
     params       = sorted(df["parameter"].unique())
     conditions   = [c for c in TEMP_ORDER if c in df["temp_cond"].unique()]
     jitter_span  = 1.2
-    used_temps   = [TEMP_AXIS_MAP[c] for c in conditions]
+    used_temps   = [tmap.get(c, 25) for c in conditions]
     x_axis_min   = (min(used_temps) - 15) if used_temps else -55
     x_axis_max   = (max(used_temps) + 15) if used_temps else 100
     data_col     = 1
@@ -200,7 +201,7 @@ def build_boltzmann(wb, df):
 
             # Compute a small jitter around the condition's base temperature so
             # overlapping points spread visually (mirrors plot_boltzmann).
-            x_base    = TEMP_AXIS_MAP.get(cond, 25)
+            x_base    = tmap.get(cond, 25)
             runs      = pd.to_numeric(sub["run_number"], errors="coerce")
             run_mean  = runs.mean()
             run_std   = runs.std() or 1
@@ -464,12 +465,13 @@ def load_and_enrich(csv_path):
     return enrich(pd.read_csv(csv_path))
 
 
-def build_workbook(df, output, log=print, progress_callback=None):
+def build_workbook(df, output, log=print, progress_callback=None, temp_map=None):
     """
     Build the full ATE workbook from an (enriched or raw) DataFrame and save
     it to ``output``. Returns the absolute output path.
 
     progress_callback(done, total) fires after each sheet.
+    temp_map overrides the Boltzmann sheet's temperature x positions.
     """
     df = enrich(df)
 
@@ -492,7 +494,10 @@ def build_workbook(df, output, log=print, progress_callback=None):
     total = len(sheets)
     for i, (name, builder) in enumerate(sheets, 1):
         log(f"  [{i}/{total}] {name}")
-        builder(wb, df)
+        if builder is build_boltzmann:
+            builder(wb, df, temp_map=temp_map)
+        else:
+            builder(wb, df)
         if progress_callback is not None:
             progress_callback(i, total)
 

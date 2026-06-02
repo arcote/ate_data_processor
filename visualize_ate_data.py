@@ -108,6 +108,17 @@ DEFAULT_THEME = "light"
 # Limit-line modes available to the Boltzmann plot.
 LIMIT_MODES = ["sigma", "minmax", "fixed", "none"]
 
+# Parameter names embed an enclosure tag like "EN4"/"EN5"/"EN6"
+# (e.g. "Bvds_EN4"). The enclosure identifies which datasheet limits apply.
+ENCLOSURE_RE = re.compile(r"(EN\d+)", re.IGNORECASE)
+
+
+def infer_enclosure(parameter: str) -> str:
+    """Return the enclosure tag (e.g. 'EN4') embedded in a parameter name, or ''."""
+    m = ENCLOSURE_RE.search(parameter or "")
+    return m.group(1).upper() if m else ""
+
+
 # Heuristic unit inference from a parameter name. Voltage-like names map to V,
 # current-like names to A; anything else is left unitless. Always overridable.
 def infer_unit(parameter: str) -> str:
@@ -313,7 +324,7 @@ def _draw_value_table(ax_tbl, sub, order, palette, theme, unit, max_rows=30):
 def plot_boltzmann(df: pd.DataFrame, out_dir: str, fmt: str, dpi: int = 150,
                    theme=None, log=print, limit_mode="sigma", sigma_k=3.0,
                    limits=None, units=None, show_title=False, show_table=True,
-                   title=None):
+                   title=None, temp_map=None):
     """
     One scatter strip per temp condition, x-axis is Temperature (°C).
 
@@ -326,8 +337,11 @@ def plot_boltzmann(df: pd.DataFrame, out_dir: str, fmt: str, dpi: int = 150,
     title      : when show_title is True, this string is used verbatim for every
                  parameter; if None the parameter name is used as the title.
     show_table : render the per-unit value table to the right of the plot.
+    temp_map   : {condition: temperature_°C}; overrides TEMP_AXIS_MAP for the
+                 x-axis positions/labels (e.g. {"COLD": -55, "ROOM": 25}).
     """
     t = get_theme(theme)
+    tmap = temp_map or TEMP_AXIS_MAP
     palette = t["temp_palette"]
     params = df["parameter"].unique()
 
@@ -348,7 +362,7 @@ def plot_boltzmann(df: pd.DataFrame, out_dir: str, fmt: str, dpi: int = 150,
         jitter = 1.2   # x-axis spread for visual separation of overlapping dots
 
         for cond, grp in sub.groupby("temp_cond"):
-            x_base = TEMP_AXIS_MAP.get(cond, 25)
+            x_base = tmap.get(cond, 25)
             # Light horizontal jitter so overlapping points separate
             x_jitter = x_base + (grp["run_number"].values - grp["run_number"].mean()) / max(grp["run_number"].std() or 1, 1) * jitter
 
@@ -395,11 +409,11 @@ def plot_boltzmann(df: pd.DataFrame, out_dir: str, fmt: str, dpi: int = 150,
 
         # X-axis: show only the temp positions present
         used_temps = sorted(sub["temp_cond"].unique(),
-                            key=lambda c: TEMP_AXIS_MAP.get(c, 0))
-        ax.set_xticks([TEMP_AXIS_MAP[c] for c in used_temps])
-        ax.set_xticklabels([f"{TEMP_AXIS_MAP[c]} °C\n({c})" for c in used_temps])
-        ax.set_xlim(min(TEMP_AXIS_MAP[c] for c in used_temps) - 15,
-                    max(TEMP_AXIS_MAP[c] for c in used_temps) + 15)
+                            key=lambda c: tmap.get(c, 0))
+        ax.set_xticks([tmap.get(c, 25) for c in used_temps])
+        ax.set_xticklabels([f"{tmap.get(c, 25)} °C\n({c})" for c in used_temps])
+        ax.set_xlim(min(tmap.get(c, 25) for c in used_temps) - 15,
+                    max(tmap.get(c, 25) for c in used_temps) + 15)
 
         # Y-axis limits: encompass the data *and* the limit lines, with padding.
         y_candidates = [sub[VALUE_COL].min(), sub[VALUE_COL].max()]
@@ -428,7 +442,7 @@ def plot_boltzmann(df: pd.DataFrame, out_dir: str, fmt: str, dpi: int = 150,
 # ─────────────────────────────────────────────────────────────────────────────
 
 def plot_boxplot(df: pd.DataFrame, out_dir: str, fmt: str, dpi: int = 150,
-                 theme=None, log=print):
+                 theme=None, log=print, title=None):
     """Distribution spread per parameter × temperature condition."""
     t = get_theme(theme)
     palette = t["temp_palette"]
@@ -439,7 +453,8 @@ def plot_boxplot(df: pd.DataFrame, out_dir: str, fmt: str, dpi: int = 150,
 
     fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 4.5 * nrows), squeeze=False)
     fig.patch.set_facecolor(t["fig_face"])
-    fig.suptitle("Box-and-Whisker: Value Distribution per Condition", fontsize=13, y=1.01)
+    fig.suptitle(title or "Box-and-Whisker: Value Distribution per Condition",
+                 fontsize=13, y=1.01)
 
     for idx, param in enumerate(params):
         ax = axes[idx // ncols][idx % ncols]
@@ -484,7 +499,7 @@ def plot_boxplot(df: pd.DataFrame, out_dir: str, fmt: str, dpi: int = 150,
 # ─────────────────────────────────────────────────────────────────────────────
 
 def plot_run_trend(df: pd.DataFrame, out_dir: str, fmt: str, dpi: int = 150,
-                   theme=None, log=print):
+                   theme=None, log=print, title=None):
     """Value vs. run number — reveals drift, outliers, repeatability issues."""
     t = get_theme(theme)
     palette = t["temp_palette"]
@@ -495,7 +510,8 @@ def plot_run_trend(df: pd.DataFrame, out_dir: str, fmt: str, dpi: int = 150,
 
     fig, axes = plt.subplots(nrows, ncols, figsize=(7 * ncols, 4 * nrows), squeeze=False)
     fig.patch.set_facecolor(t["fig_face"])
-    fig.suptitle("Run Trend: Value vs. Run Number (Drift / Stability)", fontsize=13, y=1.01)
+    fig.suptitle(title or "Run Trend: Value vs. Run Number (Drift / Stability)",
+                 fontsize=13, y=1.01)
 
     for idx, param in enumerate(params):
         ax = axes[idx // ncols][idx % ncols]
@@ -535,7 +551,7 @@ def plot_run_trend(df: pd.DataFrame, out_dir: str, fmt: str, dpi: int = 150,
 # ─────────────────────────────────────────────────────────────────────────────
 
 def plot_heatmap(df: pd.DataFrame, out_dir: str, fmt: str, dpi: int = 150,
-                 theme=None, log=print):
+                 theme=None, log=print, title=None):
     """
     Mean extracted value as a colour grid: rows = parameter×condition,
     columns = test iteration (3rd/4th/5th test).
@@ -569,7 +585,8 @@ def plot_heatmap(df: pd.DataFrame, out_dir: str, fmt: str, dpi: int = 150,
         cbar_kws={"shrink": 0.7, "label": "Mean Value"},
     )
 
-    ax.set_title("Heat Map: Mean Value — Parameter × Condition vs. Test Iteration", fontsize=11, pad=12)
+    ax.set_title(title or "Heat Map: Mean Value — Parameter × Condition vs. Test Iteration",
+                 fontsize=11, pad=12)
     ax.set_xlabel("Test Iteration", fontsize=9)
     ax.set_ylabel("Parameter | Condition", fontsize=9)
     ax.tick_params(axis="x", rotation=30)
@@ -586,7 +603,7 @@ def plot_heatmap(df: pd.DataFrame, out_dir: str, fmt: str, dpi: int = 150,
 # ─────────────────────────────────────────────────────────────────────────────
 
 def plot_histograms(df: pd.DataFrame, out_dir: str, fmt: str, dpi: int = 150,
-                    theme=None, log=print):
+                    theme=None, log=print, title=None):
     """Overlaid histograms per temp condition — shows distribution shape."""
     t = get_theme(theme)
     palette = t["temp_palette"]
@@ -597,7 +614,8 @@ def plot_histograms(df: pd.DataFrame, out_dir: str, fmt: str, dpi: int = 150,
 
     fig, axes = plt.subplots(nrows, ncols, figsize=(6.5 * ncols, 4 * nrows), squeeze=False)
     fig.patch.set_facecolor(t["fig_face"])
-    fig.suptitle("Histogram Overlay: Value Distribution per Temp Condition", fontsize=13, y=1.01)
+    fig.suptitle(title or "Histogram Overlay: Value Distribution per Temp Condition",
+                 fontsize=13, y=1.01)
 
     for idx, param in enumerate(params):
         ax = axes[idx // ncols][idx % ncols]
@@ -648,14 +666,16 @@ _PLOT_FUNCS = {
 
 
 def generate_plots(df, plots, out_dir, fmt="png", dpi=150, theme=None,
-                   log=print, progress_callback=None, boltzmann_opts=None):
+                   log=print, progress_callback=None, boltzmann_opts=None,
+                   temp_map=None):
     """
     Generate the requested plots from an enriched DataFrame.
 
     plots: iterable of names from ALL_PLOTS.
     theme: a name in THEMES (e.g. "light", "dark") or a custom theme dict.
     boltzmann_opts: extra kwargs forwarded only to plot_boltzmann (limit_mode,
-                    sigma_k, limits, units, show_title, show_table).
+                    sigma_k, limits, units, show_title, show_table, title).
+    temp_map: {condition: °C} forwarded to plot_boltzmann for x positions.
     Applies the base style, then runs each selected plot. progress_callback(
     done, total) fires after each plot type. Returns the list of plots run.
     """
@@ -663,11 +683,13 @@ def generate_plots(df, plots, out_dir, fmt="png", dpi=150, theme=None,
     apply_base_style(t)
     selected = [p for p in ALL_PLOTS if p in set(plots)]
     total = len(selected)
+    bopts = dict(boltzmann_opts or {})
+    if temp_map is not None:
+        bopts.setdefault("temp_map", temp_map)
     for i, name in enumerate(selected, 1):
         log(f"[{i}/{total}] {name}...")
         if name == "boltzmann":
-            plot_boltzmann(df, out_dir, fmt, dpi=dpi, theme=t, log=log,
-                           **(boltzmann_opts or {}))
+            plot_boltzmann(df, out_dir, fmt, dpi=dpi, theme=t, log=log, **bopts)
         else:
             _PLOT_FUNCS[name](df, out_dir, fmt, dpi=dpi, theme=t, log=log)
         if progress_callback is not None:

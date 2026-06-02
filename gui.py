@@ -105,8 +105,19 @@ class ATEReportApp:
 
         self.param_vars      = {}   # parameter name -> BooleanVar
         self.param_unit_vars = {}   # parameter name -> StringVar (Y-axis unit)
+        self.enc_vars        = {}   # enclosure tag (EN4…) -> BooleanVar
         self.cond_vars       = {}   # condition name -> BooleanVar
+        self._all_params         = []   # every parameter from the last scan
+        self._param_check_cache  = {}   # parameter -> bool (preserved across refilter)
+        self._param_unit_cache   = {}   # parameter -> unit string (preserved)
         self.plot_vars  = {p: tk.BooleanVar(value=True) for p in PLOT_LABELS}
+
+        # Temperature value per condition (°C) — drives the Boltzmann x-axis.
+        self.temp_vars = {
+            "COLD": tk.StringVar(value="-40"),
+            "ROOM": tk.StringVar(value="25"),
+            "HOT":  tk.StringVar(value="85"),
+        }
 
         self.out_xlsx_var = tk.BooleanVar(value=True)
         self.out_png_var  = tk.BooleanVar(value=True)
@@ -163,7 +174,7 @@ class ATEReportApp:
         left.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
         left.columnconfigure(0, weight=1)
         # The log row absorbs extra vertical space.
-        left.rowconfigure(6, weight=1)
+        left.rowconfigure(9, weight=1)
 
         right = ttk.Frame(outer)
         right.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
@@ -172,11 +183,13 @@ class ATEReportApp:
 
         self._build_input_row(left, row=0)
         self._build_preview(left, row=1)
-        self._build_params_panel(left, row=2)
-        self._build_conditions_panel(left, row=3)
-        self._build_output(left, row=4)
-        self._build_run_row(left, row=5)
-        self._build_log(left, row=6)
+        self._build_enclosure_panel(left, row=2)
+        self._build_params_panel(left, row=3)
+        self._build_conditions_panel(left, row=4)
+        self._build_temps_panel(left, row=5)
+        self._build_output(left, row=6)
+        self._build_run_row(left, row=7)
+        self._build_log(left, row=9)
 
         self._build_plots(right, row=0)
 
@@ -201,6 +214,14 @@ class ATEReportApp:
             text="No folder scanned yet.")
         self.preview_label.grid(row=0, column=0, sticky="ew")
 
+    def _build_enclosure_panel(self, parent, row):
+        frame = ttk.LabelFrame(parent, text="Enclosures (EN#)", padding=8)
+        frame.grid(row=row, column=0, sticky="ew", pady=(0, 8))
+        frame.columnconfigure(0, weight=1)
+        self.enc_holder = ttk.Frame(frame)
+        self.enc_holder.grid(row=0, column=0, sticky="w")
+        self._placeholder(self.enc_holder, "scan a folder to list enclosures")
+
     def _build_params_panel(self, parent, row):
         frame = ttk.LabelFrame(parent, text="Parameters", padding=8)
         frame.grid(row=row, column=0, sticky="ew", pady=(0, 8))
@@ -216,6 +237,14 @@ class ATEReportApp:
         self.cond_holder = ttk.Frame(frame)
         self.cond_holder.grid(row=0, column=0, sticky="w")
         self._placeholder(self.cond_holder, "scan a folder to list conditions")
+
+    def _build_temps_panel(self, parent, row):
+        frame = ttk.LabelFrame(parent, text="Temperatures (°C)", padding=8)
+        frame.grid(row=row, column=0, sticky="ew", pady=(0, 8))
+        for i, cond in enumerate(("COLD", "ROOM", "HOT")):
+            ttk.Label(frame, text=f"{cond}:").grid(row=0, column=i * 2, padx=(0, 4))
+            ttk.Entry(frame, textvariable=self.temp_vars[cond], width=7).grid(
+                row=0, column=i * 2 + 1, padx=(0, 16))
 
     def _build_plots(self, parent, row):
         frame = ttk.LabelFrame(parent, text="Plots", padding=8)
@@ -516,7 +545,9 @@ class ATEReportApp:
         ]
         self.preview_label.configure(text="\n".join(lines))
 
-        self._rebuild_param_rows(preview["parameters"])
+        self._all_params = list(preview["parameters"])
+        self._rebuild_enclosures(self._all_params)
+        self._rebuild_param_rows(self._visible_params())
         self._rebuild_checkboxes(
             self.cond_holder, self.cond_vars, preview["conditions"])
 
@@ -539,11 +570,53 @@ class ATEReportApp:
             ttk.Checkbutton(holder, text=name, variable=var).grid(
                 row=i // 3, column=i % 3, sticky="w", padx=(0, 12))
 
+    def _rebuild_enclosures(self, params):
+        """Build the EN# checkboxes from the parameter list. Toggling one
+        re-filters which parameters are shown."""
+        holder = self.enc_holder
+        for child in holder.winfo_children():
+            child.destroy()
+        encs = sorted({e for e in (visualize.infer_enclosure(p) for p in params) if e})
+        # Preserve prior selections where the enclosure still exists.
+        prev = {k: v.get() for k, v in self.enc_vars.items()}
+        self.enc_vars.clear()
+        if not encs:
+            self._placeholder(holder, "no EN# tags found")
+            return
+        for i, enc in enumerate(encs):
+            var = tk.BooleanVar(value=prev.get(enc, True))
+            var.trace_add("write", lambda *_: self._on_enclosure_change())
+            self.enc_vars[enc] = var
+            ttk.Checkbutton(holder, text=enc, variable=var).grid(
+                row=0, column=i, sticky="w", padx=(0, 12))
+
+    def _visible_params(self):
+        """Parameters allowed by the current EN# selection (all if none set)."""
+        selected = {e for e, v in self.enc_vars.items() if v.get()}
+        if not selected:
+            return list(self._all_params)
+        out = []
+        for p in self._all_params:
+            enc = visualize.infer_enclosure(p)
+            if not enc or enc in selected:
+                out.append(p)
+        return out
+
+    def _on_enclosure_change(self):
+        self._rebuild_param_rows(self._visible_params())
+
     def _rebuild_param_rows(self, names, per_row=3):
         """Parameter list wrapped row-major into ``per_row`` columns. Each cell
         holds the checkbox + Y-unit entry. The first ``per_row`` parameters
-        fill row 1; the next group fills row 2; and so on."""
+        fill row 1; the next group fills row 2; and so on. Check state and unit
+        text are preserved across rebuilds via caches."""
         holder = self.param_holder
+        # Cache current widget state so re-filtering doesn't lose user edits.
+        for p, var in self.param_vars.items():
+            self._param_check_cache[p] = bool(var.get())
+        for p, var in self.param_unit_vars.items():
+            self._param_unit_cache[p] = var.get()
+
         for child in holder.winfo_children():
             child.destroy()
         self.param_vars.clear()
@@ -569,12 +642,13 @@ class ATEReportApp:
             c = i % per_row
             base = c * 2
 
-            chk_var = tk.BooleanVar(value=True)
+            chk_var = tk.BooleanVar(value=self._param_check_cache.get(name, True))
             self.param_vars[name] = chk_var
             ttk.Checkbutton(holder, text=name, variable=chk_var).grid(
                 row=r, column=base, sticky="w", padx=(0, 4), pady=1)
 
-            unit_var = tk.StringVar(value=visualize.infer_unit(name))
+            unit_var = tk.StringVar(
+                value=self._param_unit_cache.get(name, visualize.infer_unit(name)))
             self.param_unit_vars[name] = unit_var
             ttk.Entry(holder, textvariable=unit_var, width=5).grid(
                 row=r, column=base + 1, sticky="w", padx=(0, 16), pady=1)
@@ -641,11 +715,23 @@ class ATEReportApp:
             "plots": plots,
             "params": set(params),
             "conds": set(conds),
+            "units": {p: v.get().strip() for p, v in self.param_unit_vars.items()
+                      if v.get().strip()},
             "img_format": self.img_format_var.get(),
             "dpi": int(self.dpi_var.get()),
             "theme": self.theme_var.get(),
+            "temp_map": self._temp_map(),
             "boltzmann_opts": self._boltzmann_opts(),
         }
+
+    def _temp_map(self):
+        """Parse the COLD/ROOM/HOT temperature entries into {cond: °C}."""
+        tmap = {}
+        for cond, var in self.temp_vars.items():
+            val = self._parse_float(var.get())
+            if val is not None:
+                tmap[cond] = val
+        return tmap
 
     def _run_worker(self, cfg):
         try:
@@ -720,16 +806,22 @@ class ATEReportApp:
             self._post("progress", base[0])
 
         # 3) Plots ---------------------------------------------------------------
+        plot_dir = None
         if produce_plots:
             log("\n=== Generating plots ===")
             plot_dir = out_dir / f"{name}_plots"
             plot_dir.mkdir(parents=True, exist_ok=True)
+            bopts = dict(cfg.get("boltzmann_opts") or {})
+            # Merge per-parameter units (from the Parameters panel) so each
+            # parameter's plot is labelled with its own unit.
+            if cfg.get("units"):
+                bopts["units"] = dict(cfg["units"])
             visualize.generate_plots(
                 df, cfg["plots"], str(plot_dir),
                 fmt=cfg["img_format"], dpi=cfg["dpi"],
                 theme=cfg["theme"], log=log,
                 progress_callback=phase_progress(step),
-                boltzmann_opts=cfg.get("boltzmann_opts"))
+                boltzmann_opts=bopts, temp_map=cfg.get("temp_map"))
             written.append(str(plot_dir))
             base[0] += step
             self._post("progress", base[0])
@@ -740,7 +832,8 @@ class ATEReportApp:
             xlsx_path = out_dir / f"{name}.xlsx"
             build.build_workbook(
                 df, str(xlsx_path), log=log,
-                progress_callback=phase_progress(step))
+                progress_callback=phase_progress(step),
+                temp_map=cfg.get("temp_map"))
             written.append(str(xlsx_path))
             base[0] += step
             self._post("progress", base[0])
@@ -749,6 +842,21 @@ class ATEReportApp:
         log("\n=== Done ===")
         for w in written:
             log(f"  {w}")
+
+        # Open the interactive results window (one tab per generated plot).
+        if produce_plots:
+            self._post("results", {
+                "df": df,
+                "params": sorted(df["parameter"].unique()),
+                "plots": cfg["plots"],
+                "plot_dir": str(plot_dir),
+                "fmt": cfg["img_format"],
+                "dpi": cfg["dpi"],
+                "theme": cfg["theme"],
+                "temp_map": cfg.get("temp_map"),
+                "units": dict(cfg.get("units") or {}),
+                "boltzmann_opts": dict(cfg.get("boltzmann_opts") or {}),
+            })
 
     # ── Queue plumbing ───────────────────────────────────────────────────────────
 
@@ -774,6 +882,8 @@ class ATEReportApp:
                     lbl = self._preview_labels.get(payload)
                     if lbl is not None:
                         lbl.configure(image="", text="(no preview)")
+                elif kind == "results":
+                    self._open_results_window(payload)
                 elif kind == "done":
                     self._set_status("Done.")
                     self.run_button.configure(state="normal")
@@ -870,6 +980,228 @@ class ATEReportApp:
         self.log_text.insert("end", text + "\n")
         self.log_text.see("end")
         self.log_text.configure(state="disabled")
+
+    # ── Results window ───────────────────────────────────────────────────────────
+
+    def _open_results_window(self, ctx):
+        try:
+            ResultsWindow(self.root, ctx)
+        except Exception:
+            self._log("\n[ERROR opening results window]\n" + traceback.format_exc())
+
+
+class ResultsWindow:
+    """A separate window with one tab per generated plot image. Each tab shows
+    the rendered plot plus the controls to customize it, and a Re-render button
+    that overwrites the corresponding file in the report's plot folder."""
+
+    def __init__(self, master, ctx):
+        self.ctx = ctx
+        self.df = ctx["df"]
+        self.plot_dir = Path(ctx["plot_dir"])
+        self.fmt = ctx["fmt"]
+        self.dpi = ctx["dpi"]
+        self.theme = ctx["theme"]
+        self.temp_map = ctx.get("temp_map")
+        self.units = ctx.get("units") or {}
+        self.bopts = ctx.get("boltzmann_opts") or {}
+
+        self.win = tk.Toplevel(master)
+        self.win.title("Results — generated plots")
+        self.win.geometry("1150x780")
+        self.win.columnconfigure(0, weight=1)
+        self.win.rowconfigure(1, weight=1)
+
+        ttk.Label(self.win, padding=8, foreground="#555555",
+                  text=("Each tab is one generated plot. Adjust its controls and "
+                        "Re-render — changes overwrite the file in the report's "
+                        "plot folder.")).grid(row=0, column=0, sticky="ew")
+
+        self.nb = ttk.Notebook(self.win)
+        self.nb.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 8))
+
+        # Per-tab state
+        self._img_refs = {}     # tab_id -> PhotoImage
+        self._src      = {}     # tab_id -> PIL.Image
+        self._labels   = {}     # tab_id -> preview Label
+        self._size     = {}     # tab_id -> last fitted width
+        self._ctrls    = {}     # tab_id -> dict of control variables
+
+        self._build_tabs()
+
+    # ── Tab construction ─────────────────────────────────────────────────────────
+
+    def _build_tabs(self):
+        plots = self.ctx["plots"]
+        if "boltzmann" in plots:
+            for param in self.ctx["params"]:
+                self._add_boltzmann_tab(param)
+        labels = {"box": "Box-and-whisker", "trend": "Run trend",
+                  "heatmap": "Heat map", "histogram": "Histogram"}
+        for key in ("box", "trend", "heatmap", "histogram"):
+            if key in plots:
+                self._add_simple_tab(key, labels[key])
+
+    def _preview_label(self, tab, tab_id):
+        lbl = ttk.Label(tab, anchor="center", relief="sunken", background="#f0f0f0")
+        lbl.grid(row=1, column=0, sticky="nsew", pady=(6, 0))
+        tab.rowconfigure(1, weight=1)
+        tab.columnconfigure(0, weight=1)
+        lbl.bind("<Configure>", lambda e, tid=tab_id: self._fit(tid, e.width))
+        self._labels[tab_id] = lbl
+        return lbl
+
+    def _add_boltzmann_tab(self, param):
+        tab_id = f"boltzmann:{param}"
+        tab = ttk.Frame(self.nb, padding=8)
+        self.nb.add(tab, text=param)
+        tab.columnconfigure(0, weight=1)
+
+        ctl = ttk.Frame(tab)
+        ctl.grid(row=0, column=0, sticky="ew")
+
+        title_var = tk.StringVar(value=param)
+        unit_var  = tk.StringVar(value=self.units.get(param, visualize.infer_unit(param)))
+        mode_var  = tk.StringVar(value=self.bopts.get("limit_mode", "sigma"))
+        k_var     = tk.DoubleVar(value=self.bopts.get("sigma_k", 3.0))
+        min_var   = tk.StringVar(value="")
+        max_var   = tk.StringVar(value="")
+        table_var = tk.BooleanVar(value=bool(self.bopts.get("show_table", True)))
+
+        r1 = ttk.Frame(ctl); r1.grid(row=0, column=0, sticky="ew")
+        ttk.Label(r1, text="Title:").grid(row=0, column=0, padx=(0, 4))
+        ttk.Entry(r1, textvariable=title_var, width=22).grid(row=0, column=1, padx=(0, 12))
+        ttk.Label(r1, text="Y unit:").grid(row=0, column=2, padx=(0, 4))
+        ttk.Entry(r1, textvariable=unit_var, width=6).grid(row=0, column=3, padx=(0, 12))
+        ttk.Checkbutton(r1, text="Value table", variable=table_var).grid(row=0, column=4)
+
+        r2 = ttk.Frame(ctl); r2.grid(row=1, column=0, sticky="ew", pady=(4, 0))
+        ttk.Label(r2, text="Limits:").grid(row=0, column=0, padx=(0, 4))
+        ttk.Combobox(r2, textvariable=mode_var, values=visualize.LIMIT_MODES,
+                     width=8, state="readonly").grid(row=0, column=1, padx=(0, 12))
+        ttk.Label(r2, text="k·σ:").grid(row=0, column=2, padx=(0, 4))
+        ttk.Spinbox(r2, from_=0.5, to=10, increment=0.5, width=5,
+                    textvariable=k_var).grid(row=0, column=3, padx=(0, 12))
+        ttk.Label(r2, text="Min:").grid(row=0, column=4, padx=(0, 4))
+        ttk.Entry(r2, textvariable=min_var, width=9).grid(row=0, column=5, padx=(0, 8))
+        ttk.Label(r2, text="Max:").grid(row=0, column=6, padx=(0, 4))
+        ttk.Entry(r2, textvariable=max_var, width=9).grid(row=0, column=7, padx=(0, 12))
+        ttk.Button(r2, text="Re-render",
+                   command=lambda p=param: self._render_boltzmann(p)).grid(row=0, column=8)
+
+        self._ctrls[tab_id] = dict(title=title_var, unit=unit_var, mode=mode_var,
+                                   k=k_var, min=min_var, max=max_var, table=table_var)
+        self._preview_label(tab, tab_id)
+        self._load_existing(tab_id, f"1_boltzmann_{param}")
+
+    def _add_simple_tab(self, key, label):
+        tab = ttk.Frame(self.nb, padding=8)
+        self.nb.add(tab, text=label)
+        tab.columnconfigure(0, weight=1)
+
+        ctl = ttk.Frame(tab)
+        ctl.grid(row=0, column=0, sticky="ew")
+        title_var = tk.StringVar(value="")
+        ttk.Label(ctl, text="Title:").grid(row=0, column=0, padx=(0, 4))
+        ttk.Entry(ctl, textvariable=title_var, width=40).grid(row=0, column=1, padx=(0, 8))
+        ttk.Label(ctl, text="(blank = default)", foreground="#888888").grid(row=0, column=2)
+        ttk.Button(ctl, text="Re-render",
+                   command=lambda k=key: self._render_simple(k)).grid(row=0, column=3, padx=(12, 0))
+
+        self._ctrls[key] = dict(title=title_var)
+        self._preview_label(tab, key)
+        fname = {"box": "2_boxplot", "trend": "3_run_trend",
+                 "heatmap": "4_heatmap", "histogram": "5_histogram"}[key]
+        self._load_existing(key, fname)
+
+    # ── Rendering ────────────────────────────────────────────────────────────────
+
+    def _parse_float(self, s):
+        try:
+            return float(s)
+        except (TypeError, ValueError):
+            return None
+
+    def _render_boltzmann(self, param):
+        tab_id = f"boltzmann:{param}"
+        c = self._ctrls[tab_id]
+        lbl = self._labels[tab_id]
+        lbl.configure(text="rendering…", image="")
+        self.win.update_idletasks()
+        mode = c["mode"].get()
+        unit = c["unit"].get().strip()
+        opts = dict(
+            limit_mode=mode,
+            sigma_k=self._parse_float(c["k"].get()) or 3.0,
+            show_table=bool(c["table"].get()),
+            show_title=True,
+            title=c["title"].get().strip() or None,
+            units={param: unit} if unit else None,
+            temp_map=self.temp_map,
+        )
+        if mode == "fixed":
+            opts["limits"] = {param: (self._parse_float(c["min"].get()),
+                                      self._parse_float(c["max"].get()))}
+        try:
+            visualize.apply_base_style(self.theme)
+            sub = self.df[self.df["parameter"] == param]
+            visualize.plot_boltzmann(sub, str(self.plot_dir), self.fmt,
+                                     dpi=self.dpi, theme=self.theme,
+                                     log=lambda *_: None, **opts)
+            self._load_existing(tab_id, f"1_boltzmann_{param}")
+        except Exception:
+            lbl.configure(text="render error:\n" + traceback.format_exc())
+
+    def _render_simple(self, key):
+        c = self._ctrls[key]
+        lbl = self._labels[key]
+        lbl.configure(text="rendering…", image="")
+        self.win.update_idletasks()
+        func = {"box": visualize.plot_boxplot, "trend": visualize.plot_run_trend,
+                "heatmap": visualize.plot_heatmap,
+                "histogram": visualize.plot_histograms}[key]
+        fname = {"box": "2_boxplot", "trend": "3_run_trend",
+                 "heatmap": "4_heatmap", "histogram": "5_histogram"}[key]
+        title = c["title"].get().strip() or None
+        try:
+            visualize.apply_base_style(self.theme)
+            func(self.df, str(self.plot_dir), self.fmt, dpi=self.dpi,
+                 theme=self.theme, log=lambda *_: None, title=title)
+            self._load_existing(key, fname)
+        except Exception:
+            lbl.configure(text="render error:\n" + traceback.format_exc())
+
+    # ── Image display ────────────────────────────────────────────────────────────
+
+    def _load_existing(self, tab_id, stem):
+        path = self.plot_dir / f"{stem}.{self.fmt}"
+        lbl = self._labels[tab_id]
+        if not path.exists():
+            lbl.configure(text="(not generated)", image="")
+            self._src.pop(tab_id, None)
+            return
+        try:
+            self._src[tab_id] = Image.open(path).copy()
+        except Exception:
+            lbl.configure(text="(image unavailable)", image="")
+            return
+        self._size[tab_id] = None
+        self._fit(tab_id, lbl.winfo_width())
+
+    def _fit(self, tab_id, width):
+        src = self._src.get(tab_id)
+        lbl = self._labels.get(tab_id)
+        if src is None or lbl is None or src.width <= 0:
+            return
+        w = max(width - 8, 200)
+        if self._size.get(tab_id) == w:
+            return
+        self._size[tab_id] = w
+        new_h = max(1, int(round(src.height * (w / src.width))))
+        img = src.resize((w, new_h), Image.LANCZOS)
+        photo = ImageTk.PhotoImage(img)
+        self._img_refs[tab_id] = photo
+        lbl.configure(image=photo, text="")
 
 
 def main():
