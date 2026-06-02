@@ -25,6 +25,13 @@ import sys
 import re
 import warnings
 
+import matplotlib
+# Default to the non-interactive Agg backend so this module is safe to import
+# from a GUI/worker thread or a headless server. A standalone CLI run can opt
+# back into an interactive backend via --show (handled in main()).
+if not os.environ.get("MPLBACKEND"):
+    matplotlib.use("Agg")
+
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
@@ -72,15 +79,19 @@ def detect_parameter(temp_folder: str) -> str:
     return re.sub(r"_(COLD|HOT|ROOM)$", "", temp_folder, flags=re.IGNORECASE)
 
 
-def load_and_enrich(csv_path: str) -> pd.DataFrame:
-    df = pd.read_csv(csv_path)
-
+def enrich(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add the derived columns the plots rely on (temp_cond, parameter, temp_x,
+    color) and coerce numerics. Idempotent — safe to call on a frame that has
+    already been enriched. Operates on a copy.
+    """
     required = {"test_folder", "temp_folder", "run_number", VALUE_COL}
     missing  = required - set(df.columns)
     if missing:
-        sys.exit(f"[ERROR] Input CSV is missing columns: {missing}\n"
-                 f"       Expected columns: {required}")
+        raise ValueError(f"Input is missing columns: {missing}\n"
+                         f"       Expected columns: {required}")
 
+    df = df.copy()
     df[VALUE_COL]     = pd.to_numeric(df[VALUE_COL], errors="coerce")
     df["run_number"]  = pd.to_numeric(df["run_number"], errors="coerce")
     df["temp_cond"]   = df["temp_folder"].apply(detect_temp_condition)
@@ -92,11 +103,21 @@ def load_and_enrich(csv_path: str) -> pd.DataFrame:
     return df
 
 
-def save_fig(fig, out_dir: str, name: str, fmt: str):
+def load_and_enrich(csv_path: str) -> pd.DataFrame:
+    """Read the extraction CSV and enrich it. Exits the process on bad input."""
+    try:
+        df = pd.read_csv(csv_path)
+        return enrich(df)
+    except ValueError as exc:
+        sys.exit(f"[ERROR] {exc}")
+
+
+def save_fig(fig, out_dir: str, name: str, fmt: str, dpi: int = 150, log=print):
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, f"{name}.{fmt}")
-    fig.savefig(path, dpi=150, bbox_inches="tight", facecolor="#ffffff")
-    print(f"  Saved → {path}")
+    fig.savefig(path, dpi=dpi, bbox_inches="tight", facecolor="#ffffff")
+    log(f"  Saved → {path}")
+    return path
 
 
 def apply_base_style():
@@ -124,7 +145,7 @@ def apply_base_style():
 # Plot 1 — Boltzmann Scatter (reference format)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def plot_boltzmann(df: pd.DataFrame, out_dir: str, fmt: str):
+def plot_boltzmann(df: pd.DataFrame, out_dir: str, fmt: str, dpi: int = 150, log=print):
     """One scatter strip per temp condition, x-axis is temperature (°C)."""
     params = df["parameter"].unique()
 
@@ -170,8 +191,7 @@ def plot_boltzmann(df: pd.DataFrame, out_dir: str, fmt: str):
         ax.legend(by_label.values(), by_label.keys(), loc="upper left")
 
         fig.tight_layout()
-        save_fig(fig, out_dir, f"1_boltzmann_{param}", fmt)
-        plt.show()
+        save_fig(fig, out_dir, f"1_boltzmann_{param}", fmt, dpi=dpi, log=log)
         plt.close(fig)
 
 
@@ -179,7 +199,7 @@ def plot_boltzmann(df: pd.DataFrame, out_dir: str, fmt: str):
 # Plot 2 — Box-and-Whisker
 # ─────────────────────────────────────────────────────────────────────────────
 
-def plot_boxplot(df: pd.DataFrame, out_dir: str, fmt: str):
+def plot_boxplot(df: pd.DataFrame, out_dir: str, fmt: str, dpi: int = 150, log=print):
     """Distribution spread per parameter × temperature condition."""
     params = df["parameter"].unique()
     n = len(params)
@@ -223,8 +243,7 @@ def plot_boxplot(df: pd.DataFrame, out_dir: str, fmt: str):
         axes[idx // ncols][idx % ncols].set_visible(False)
 
     fig.tight_layout()
-    save_fig(fig, out_dir, "2_boxplot", fmt)
-    plt.show()
+    save_fig(fig, out_dir, "2_boxplot", fmt, dpi=dpi, log=log)
     plt.close(fig)
 
 
@@ -232,7 +251,7 @@ def plot_boxplot(df: pd.DataFrame, out_dir: str, fmt: str):
 # Plot 3 — Run Trend (stability / drift check)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def plot_run_trend(df: pd.DataFrame, out_dir: str, fmt: str):
+def plot_run_trend(df: pd.DataFrame, out_dir: str, fmt: str, dpi: int = 150, log=print):
     """Value vs. run number — reveals drift, outliers, repeatability issues."""
     params = df["parameter"].unique()
     n = len(params)
@@ -271,8 +290,7 @@ def plot_run_trend(df: pd.DataFrame, out_dir: str, fmt: str):
         axes[idx // ncols][idx % ncols].set_visible(False)
 
     fig.tight_layout()
-    save_fig(fig, out_dir, "3_run_trend", fmt)
-    plt.show()
+    save_fig(fig, out_dir, "3_run_trend", fmt, dpi=dpi, log=log)
     plt.close(fig)
 
 
@@ -280,7 +298,7 @@ def plot_run_trend(df: pd.DataFrame, out_dir: str, fmt: str):
 # Plot 4 — Heat Map (mean value grid)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def plot_heatmap(df: pd.DataFrame, out_dir: str, fmt: str):
+def plot_heatmap(df: pd.DataFrame, out_dir: str, fmt: str, dpi: int = 150, log=print):
     """
     Mean extracted value as a colour grid: rows = parameter×condition,
     columns = test iteration (3rd/4th/5th test).
@@ -295,7 +313,7 @@ def plot_heatmap(df: pd.DataFrame, out_dir: str, fmt: str):
     )
 
     if pivot.empty:
-        print("  [SKIP] Heatmap: not enough variation across test folders.")
+        log("  [SKIP] Heatmap: not enough variation across test folders.")
         return
 
     fig, ax = plt.subplots(figsize=(max(6, len(pivot.columns) * 2.2), max(4, len(pivot) * 0.55 + 1.5)))
@@ -319,8 +337,7 @@ def plot_heatmap(df: pd.DataFrame, out_dir: str, fmt: str):
     ax.tick_params(axis="y", rotation=0)
 
     fig.tight_layout()
-    save_fig(fig, out_dir, "4_heatmap", fmt)
-    plt.show()
+    save_fig(fig, out_dir, "4_heatmap", fmt, dpi=dpi, log=log)
     plt.close(fig)
 
 
@@ -328,7 +345,7 @@ def plot_heatmap(df: pd.DataFrame, out_dir: str, fmt: str):
 # Plot 5 — Histogram Overlay
 # ─────────────────────────────────────────────────────────────────────────────
 
-def plot_histograms(df: pd.DataFrame, out_dir: str, fmt: str):
+def plot_histograms(df: pd.DataFrame, out_dir: str, fmt: str, dpi: int = 150, log=print):
     """Overlaid histograms per temp condition — shows distribution shape."""
     params = df["parameter"].unique()
     n = len(params)
@@ -367,9 +384,43 @@ def plot_histograms(df: pd.DataFrame, out_dir: str, fmt: str):
         axes[idx // ncols][idx % ncols].set_visible(False)
 
     fig.tight_layout()
-    save_fig(fig, out_dir, "5_histogram", fmt)
-    plt.show()
+    save_fig(fig, out_dir, "5_histogram", fmt, dpi=dpi, log=log)
     plt.close(fig)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Dispatcher
+# ─────────────────────────────────────────────────────────────────────────────
+
+ALL_PLOTS = ["boltzmann", "box", "trend", "heatmap", "histogram"]
+
+_PLOT_FUNCS = {
+    "boltzmann": plot_boltzmann,
+    "box":       plot_boxplot,
+    "trend":     plot_run_trend,
+    "heatmap":   plot_heatmap,
+    "histogram": plot_histograms,
+}
+
+
+def generate_plots(df, plots, out_dir, fmt="png", dpi=150, log=print,
+                   progress_callback=None):
+    """
+    Generate the requested plots from an enriched DataFrame.
+
+    plots: iterable of names from ALL_PLOTS.
+    Applies the base style, then runs each selected plot. progress_callback(
+    done, total) fires after each plot type. Returns the list of plots run.
+    """
+    apply_base_style()
+    selected = [p for p in ALL_PLOTS if p in set(plots)]
+    total = len(selected)
+    for i, name in enumerate(selected, 1):
+        log(f"[{i}/{total}] {name}...")
+        _PLOT_FUNCS[name](df, out_dir, fmt, dpi=dpi, log=log)
+        if progress_callback is not None:
+            progress_callback(i, total)
+    return selected
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -393,8 +444,8 @@ def main():
         help="Output file format (default: png)"
     )
     parser.add_argument(
-        "--no-show", action="store_true",
-        help="Skip interactive display — save only (useful for headless/server runs)"
+        "--dpi", type=int, default=150,
+        help="Output resolution for raster formats (default: 150)"
     )
     parser.add_argument(
         "--plots", default="all",
@@ -405,12 +456,6 @@ def main():
     )
     args = parser.parse_args()
 
-    if args.no_show:
-        import matplotlib
-        matplotlib.use("Agg")
-
-    apply_base_style()
-
     print(f"Loading: {args.input}")
     df = load_and_enrich(args.input)
     print(f"  {len(df)} rows | {df['parameter'].nunique()} parameters | "
@@ -418,30 +463,12 @@ def main():
           f"{df['test_folder'].nunique()} test iterations\n")
 
     requested = (
-        {"boltzmann", "box", "trend", "heatmap", "histogram"}
+        ALL_PLOTS
         if args.plots.lower() == "all"
-        else {p.strip().lower() for p in args.plots.split(",")}
+        else [p.strip().lower() for p in args.plots.split(",")]
     )
 
-    if "boltzmann" in requested:
-        print("[1/5] Boltzmann scatter...")
-        plot_boltzmann(df, args.output_dir, args.format)
-
-    if "box" in requested:
-        print("[2/5] Box-and-whisker...")
-        plot_boxplot(df, args.output_dir, args.format)
-
-    if "trend" in requested:
-        print("[3/5] Run trend...")
-        plot_run_trend(df, args.output_dir, args.format)
-
-    if "heatmap" in requested:
-        print("[4/5] Heat map...")
-        plot_heatmap(df, args.output_dir, args.format)
-
-    if "histogram" in requested:
-        print("[5/5] Histogram overlay...")
-        plot_histograms(df, args.output_dir, args.format)
+    generate_plots(df, requested, args.output_dir, args.format, dpi=args.dpi)
 
     print("\nAll done.")
 

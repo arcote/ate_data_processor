@@ -416,6 +416,71 @@ def build_histogram(wb, df):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+def enrich(df):
+    """
+    Coerce numerics and add the temp_cond / parameter columns the sheet
+    builders rely on. Idempotent; operates on a copy.
+    """
+    required = {"test_folder", "temp_folder", "run_number", VALUE_COL}
+    missing  = required - set(df.columns)
+    if missing:
+        raise ValueError(f"Input is missing columns: {missing}\n"
+                         f"       Expected columns: {required}")
+
+    df = df.copy()
+    df[VALUE_COL]    = pd.to_numeric(df[VALUE_COL],    errors="coerce")
+    df["run_number"] = pd.to_numeric(df["run_number"], errors="coerce")
+    df["temp_cond"]  = df["temp_folder"].apply(detect_temp)
+    df["parameter"]  = df["temp_folder"].apply(detect_param)
+    df.dropna(subset=[VALUE_COL], inplace=True)
+    return df
+
+
+def load_and_enrich(csv_path):
+    """Read the extraction CSV and enrich it for report building."""
+    return enrich(pd.read_csv(csv_path))
+
+
+def build_workbook(df, output, log=print, progress_callback=None):
+    """
+    Build the full ATE workbook from an (enriched or raw) DataFrame and save
+    it to ``output``. Returns the absolute output path.
+
+    progress_callback(done, total) fires after each sheet.
+    """
+    df = enrich(df)
+
+    log(f"  {len(df)} rows | {df['parameter'].nunique()} params | "
+        f"{df['temp_cond'].nunique()} conditions | "
+        f"{df['test_folder'].nunique()} test iterations")
+
+    sheets = [
+        ("RAW DATA",      build_raw_data),
+        ("SUMMARY STATS", build_summary),
+        ("BOLTZMANN",     build_boltzmann),
+        ("RUN TREND",     build_trend),
+        ("BOX PLOT",      build_boxplot),
+        ("HISTOGRAM",     build_histogram),
+    ]
+
+    wb = Workbook()
+    wb.remove(wb.active)
+    log("Building sheets...")
+    total = len(sheets)
+    for i, (name, builder) in enumerate(sheets, 1):
+        log(f"  [{i}/{total}] {name}")
+        builder(wb, df)
+        if progress_callback is not None:
+            progress_callback(i, total)
+
+    out = os.path.expanduser(output)
+    out_dir = os.path.dirname(os.path.abspath(out))
+    os.makedirs(out_dir, exist_ok=True)
+    wb.save(out)
+    log(f"\nSaved \u2192 {out}")
+    return os.path.abspath(out)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Build ATE Excel report with native charts.")
     parser.add_argument("--input",  default="results.csv",     help="Extraction CSV")
@@ -423,30 +488,8 @@ def main():
     args = parser.parse_args()
 
     print(f"Loading: {args.input}")
-    df = pd.read_csv(args.input)
-    df[VALUE_COL]    = pd.to_numeric(df[VALUE_COL],    errors="coerce")
-    df["run_number"] = pd.to_numeric(df["run_number"], errors="coerce")
-    df["temp_cond"]  = df["temp_folder"].apply(detect_temp)
-    df["parameter"]  = df["temp_folder"].apply(detect_param)
-    df.dropna(subset=[VALUE_COL], inplace=True)
-
-    print(f"  {len(df)} rows | {df['parameter'].nunique()} params | "
-          f"{df['temp_cond'].nunique()} conditions | "
-          f"{df['test_folder'].nunique()} test iterations")
-
-    wb = Workbook()
-    wb.remove(wb.active)
-    print("Building sheets...")
-    build_raw_data(wb, df)
-    build_summary(wb, df)
-    build_boltzmann(wb, df)
-    build_trend(wb, df)
-    build_boxplot(wb, df)
-    build_histogram(wb, df)
-
-    out = os.path.expanduser(args.output)
-    wb.save(out)
-    print(f"\nSaved \u2192 {out}")
+    df = load_and_enrich(args.input)
+    build_workbook(df, args.output)
 
 if __name__ == "__main__":
     main()
