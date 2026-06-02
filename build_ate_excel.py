@@ -30,6 +30,7 @@ ALT_ROW_FILL = "F2F7FB"
 WHITE        = "FFFFFF"
 BORDER_COLOR = "BFBFBF"
 TEMP_ORDER   = ["COLD", "ROOM", "HOT"]
+TEMP_AXIS_MAP = {"COLD": -40, "ROOM": 25, "HOT": 85}
 VALUE_COL    = "extracted_value"
 
 # ── Style helpers ─────────────────────────────────────────────────────────────
@@ -159,14 +160,24 @@ def build_summary(wb, df):
 # ── BOLTZMANN SCATTER ─────────────────────────────────────────────────────────
 
 def build_boltzmann(wb, df):
+    """
+    Native scatter mirroring the matplotlib Boltzmann plot:
+    x-axis is Temperature (°C), each condition is a cluster at its
+    TEMP_AXIS_MAP position with a small run-number-based jitter so overlapping
+    points spread visually.
+    """
     ws = wb.create_sheet("BOLTZMANN")
     ws["A1"] = "Boltzmann Scatter — Value by Temperature Condition"
     ws["A1"].font = hfont(size=13, color=HEADER_FILL)
 
-    params     = sorted(df["parameter"].unique())
-    conditions = [c for c in TEMP_ORDER if c in df["temp_cond"].unique()]
-    data_col   = 1
-    chart_row  = 3
+    params       = sorted(df["parameter"].unique())
+    conditions   = [c for c in TEMP_ORDER if c in df["temp_cond"].unique()]
+    jitter_span  = 1.2
+    used_temps   = [TEMP_AXIS_MAP[c] for c in conditions]
+    x_axis_min   = (min(used_temps) - 15) if used_temps else -55
+    x_axis_max   = (max(used_temps) + 15) if used_temps else 100
+    data_col     = 1
+    chart_row    = 3
 
     for param in params:
         lbl_row = chart_row
@@ -185,12 +196,22 @@ def build_boltzmann(wb, df):
 
             # Write the condition name into the title cell (chart will ref this)
             ws.cell(row=title_row, column=y_col, value=cond)
-            ws.cell(row=title_row, column=x_col, value="Run#")
+            ws.cell(row=title_row, column=x_col, value=f"{cond} \u00b0C")
+
+            # Compute a small jitter around the condition's base temperature so
+            # overlapping points spread visually (mirrors plot_boltzmann).
+            x_base    = TEMP_AXIS_MAP.get(cond, 25)
+            runs      = pd.to_numeric(sub["run_number"], errors="coerce")
+            run_mean  = runs.mean()
+            run_std   = runs.std() or 1
+            scale     = max(run_std, 1)
 
             first_data = hdr_row + 1
             dr = first_data
             for seq, (_, r) in enumerate(sub.iterrows(), 1):
-                ws.cell(row=dr, column=x_col, value=safe_run(r["run_number"], seq))
+                run_val = safe_run(r["run_number"], seq)
+                offset  = ((run_val - run_mean) / scale) * jitter_span if pd.notna(run_mean) else 0
+                ws.cell(row=dr, column=x_col, value=float(x_base + offset))
                 ws.cell(row=dr, column=y_col, value=float(r[VALUE_COL]))
                 dr += 1
 
@@ -201,9 +222,11 @@ def build_boltzmann(wb, df):
         chart = ScatterChart()
         chart.title           = f"Boltzmann \u2014 {param}"
         chart.style           = 2
-        chart.x_axis.title    = "Run #"
+        chart.x_axis.title    = "Temperature (\u00b0C)"
         chart.y_axis.title    = f"{param}  (Extracted Value)"
         chart.x_axis.numFmt   = "0"
+        chart.x_axis.scaling.min = x_axis_min
+        chart.x_axis.scaling.max = x_axis_max
         chart.legend.position = "r"
         chart.width = 22; chart.height = 13
 
@@ -416,6 +439,71 @@ def build_histogram(wb, df):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+def enrich(df):
+    """
+    Coerce numerics and add the temp_cond / parameter columns the sheet
+    builders rely on. Idempotent; operates on a copy.
+    """
+    required = {"test_folder", "temp_folder", "run_number", VALUE_COL}
+    missing  = required - set(df.columns)
+    if missing:
+        raise ValueError(f"Input is missing columns: {missing}\n"
+                         f"       Expected columns: {required}")
+
+    df = df.copy()
+    df[VALUE_COL]    = pd.to_numeric(df[VALUE_COL],    errors="coerce")
+    df["run_number"] = pd.to_numeric(df["run_number"], errors="coerce")
+    df["temp_cond"]  = df["temp_folder"].apply(detect_temp)
+    df["parameter"]  = df["temp_folder"].apply(detect_param)
+    df.dropna(subset=[VALUE_COL], inplace=True)
+    return df
+
+
+def load_and_enrich(csv_path):
+    """Read the extraction CSV and enrich it for report building."""
+    return enrich(pd.read_csv(csv_path))
+
+
+def build_workbook(df, output, log=print, progress_callback=None):
+    """
+    Build the full ATE workbook from an (enriched or raw) DataFrame and save
+    it to ``output``. Returns the absolute output path.
+
+    progress_callback(done, total) fires after each sheet.
+    """
+    df = enrich(df)
+
+    log(f"  {len(df)} rows | {df['parameter'].nunique()} params | "
+        f"{df['temp_cond'].nunique()} conditions | "
+        f"{df['test_folder'].nunique()} test iterations")
+
+    sheets = [
+        ("RAW DATA",      build_raw_data),
+        ("SUMMARY STATS", build_summary),
+        ("BOLTZMANN",     build_boltzmann),
+        ("RUN TREND",     build_trend),
+        ("BOX PLOT",      build_boxplot),
+        ("HISTOGRAM",     build_histogram),
+    ]
+
+    wb = Workbook()
+    wb.remove(wb.active)
+    log("Building sheets...")
+    total = len(sheets)
+    for i, (name, builder) in enumerate(sheets, 1):
+        log(f"  [{i}/{total}] {name}")
+        builder(wb, df)
+        if progress_callback is not None:
+            progress_callback(i, total)
+
+    out = os.path.expanduser(output)
+    out_dir = os.path.dirname(os.path.abspath(out))
+    os.makedirs(out_dir, exist_ok=True)
+    wb.save(out)
+    log(f"\nSaved \u2192 {out}")
+    return os.path.abspath(out)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Build ATE Excel report with native charts.")
     parser.add_argument("--input",  default="results.csv",     help="Extraction CSV")
@@ -423,30 +511,8 @@ def main():
     args = parser.parse_args()
 
     print(f"Loading: {args.input}")
-    df = pd.read_csv(args.input)
-    df[VALUE_COL]    = pd.to_numeric(df[VALUE_COL],    errors="coerce")
-    df["run_number"] = pd.to_numeric(df["run_number"], errors="coerce")
-    df["temp_cond"]  = df["temp_folder"].apply(detect_temp)
-    df["parameter"]  = df["temp_folder"].apply(detect_param)
-    df.dropna(subset=[VALUE_COL], inplace=True)
-
-    print(f"  {len(df)} rows | {df['parameter'].nunique()} params | "
-          f"{df['temp_cond'].nunique()} conditions | "
-          f"{df['test_folder'].nunique()} test iterations")
-
-    wb = Workbook()
-    wb.remove(wb.active)
-    print("Building sheets...")
-    build_raw_data(wb, df)
-    build_summary(wb, df)
-    build_boltzmann(wb, df)
-    build_trend(wb, df)
-    build_boxplot(wb, df)
-    build_histogram(wb, df)
-
-    out = os.path.expanduser(args.output)
-    wb.save(out)
-    print(f"\nSaved \u2192 {out}")
+    df = load_and_enrich(args.input)
+    build_workbook(df, args.output)
 
 if __name__ == "__main__":
     main()
