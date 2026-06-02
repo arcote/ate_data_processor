@@ -131,14 +131,12 @@ class ATEReportApp:
         # garbage-collect them, the cached demo DataFrame, and a temp dir.
         self._preview_dir = Path(tempfile.mkdtemp(prefix="ate_preview_"))
         self._preview_df = make_demo_dataframe()
-        self._preview_images  = {}     # plot_key -> ImageTk.PhotoImage (shown)
-        self._preview_src     = {}     # plot_key -> PIL.Image (full-res source)
-        self._preview_labels  = {}     # plot_key -> ttk.Label
-        self._preview_size    = {}     # plot_key -> last rendered (w, h)
-        self._preview_zoom    = {}     # plot_key -> "fit" | "width"
-        self._zoom_buttons    = {}     # plot_key -> ttk.Button (toggle)
-        self._preview_thread  = None
-        self._popouts         = []     # live Toplevel pop-out windows
+        self._preview_images = {}      # plot_key -> ImageTk.PhotoImage (shown)
+        self._preview_src    = {}      # plot_key -> PIL.Image (full-res source)
+        self._preview_labels = {}      # plot_key -> ttk.Label
+        self._preview_size   = {}      # plot_key -> last rendered width
+        self._preview_thread = None
+        self._popouts        = []      # live Toplevel pop-out windows
 
         self._build_ui()
         self.root.after(100, self._drain_queue)
@@ -239,14 +237,9 @@ class ATEReportApp:
             ttk.Checkbutton(top, text=f"Include {label}",
                             variable=self.plot_vars[key]).grid(
                 row=0, column=0, sticky="w")
-
-            zoom_btn = ttk.Button(top, text="+", width=3,
-                                  command=lambda k=key: self._toggle_zoom(k))
-            zoom_btn.grid(row=0, column=1, sticky="e", padx=(0, 4))
-            self._zoom_buttons[key] = zoom_btn
             ttk.Button(top, text="Pop out ⤢", width=10,
                        command=lambda k=key: self._popout_preview(k)).grid(
-                row=0, column=2, sticky="e")
+                row=0, column=1, sticky="e")
 
             preview_row = 1
             if key == "boltzmann":
@@ -772,55 +765,28 @@ class ATEReportApp:
         self._fit_preview(key)
 
     def _fit_preview(self, key):
-        """Scale the cached source image into the preview label.
-
-        Modes:
-          "fit"   — fit to both dimensions (default; aspect preserved)
-          "width" — scale so the image spans the full label width; height
-                    follows the aspect ratio and may exceed the label
-        """
+        """Scale the cached source image to span the full preview width;
+        height follows the source aspect ratio."""
         lbl = self._preview_labels.get(key)
         src = self._preview_src.get(key)
-        if lbl is None or src is None:
+        if lbl is None or src is None or src.width <= 0:
             return
-        w = max(lbl.winfo_width()  - 8, 200)
-        h = max(lbl.winfo_height() - 8, 150)
-        mode = self._preview_zoom.get(key, "fit")
-        if self._preview_size.get(key) == (w, h, mode):
-            return                          # nothing changed — avoid churn
-        self._preview_size[key] = (w, h, mode)
-
-        if mode == "width" and src.width > 0:
-            new_w = w
-            new_h = max(1, int(round(src.height * (w / src.width))))
-            img = src.resize((new_w, new_h), Image.LANCZOS)
-        else:
-            img = src.copy()
-            img.thumbnail((w, h), Image.LANCZOS)
-
+        w = max(lbl.winfo_width() - 8, 200)
+        if self._preview_size.get(key) == w:
+            return                          # already at this width — avoid churn
+        self._preview_size[key] = w
+        new_h = max(1, int(round(src.height * (w / src.width))))
+        img = src.resize((w, new_h), Image.LANCZOS)
         photo = ImageTk.PhotoImage(img)
         self._preview_images[key] = photo   # keep ref
         lbl.configure(image=photo, text="")
-
-    def _toggle_zoom(self, key):
-        """+ / − toggle: switch between fit-both and fit-width for one preview."""
-        cur = self._preview_zoom.get(key, "fit")
-        new = "width" if cur == "fit" else "fit"
-        self._preview_zoom[key] = new
-        btn = self._zoom_buttons.get(key)
-        if btn is not None:
-            btn.configure(text="−" if new == "width" else "+")
-        # Force re-fit since the mode changed even if the size didn't.
-        self._preview_size[key] = None
-        self._fit_preview(key)
 
     def _on_preview_configure(self, key, event):
         """Rescale the preview when its tab/label is resized."""
         if self._preview_src.get(key) is None:
             return
         last = self._preview_size.get(key)
-        if last and abs(event.width  - 8 - last[0]) < 4 \
-                and abs(event.height - 8 - last[1]) < 4:
+        if last is not None and abs(event.width - 8 - last) < 4:
             return
         self._fit_preview(key)
 
