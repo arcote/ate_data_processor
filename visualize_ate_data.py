@@ -699,7 +699,13 @@ def main():
     )
     parser.add_argument(
         "--y-unit", default=None,
-        help="Override the Boltzmann y-axis unit for all params (blank = infer)"
+        help="Global Boltzmann y-axis unit fallback (overridden by --units)"
+    )
+    parser.add_argument(
+        "--units", default=None,
+        help=("Per-parameter Y units as 'param=unit,param=unit'. "
+              "Use '*=unit' for a fallback. Wins over --y-unit and over the "
+              "name-based inference.")
     )
     parser.add_argument(
         "--no-table", action="store_true",
@@ -730,12 +736,27 @@ def main():
         else [p.strip().lower() for p in args.plots.split(",")]
     )
 
+    units_arg = None
+    if args.units:
+        units_arg = {}
+        for piece in args.units.split(","):
+            if "=" not in piece:
+                continue
+            k, v = piece.split("=", 1)
+            k, v = k.strip(), v.strip()
+            if k and v:
+                units_arg[k] = v
+        if args.y_unit and "*" not in units_arg:
+            units_arg["*"] = args.y_unit
+    elif args.y_unit:
+        units_arg = args.y_unit
+
     boltzmann_opts = {
         "limit_mode": args.limit_mode,
         "sigma_k":    args.sigma_k,
         "limits":     (args.limit_low, args.limit_high)
                       if args.limit_mode == "fixed" else None,
-        "units":      args.y_unit or None,
+        "units":      units_arg,
         "show_table": not args.no_table,
         "show_title": args.show_title,
     }

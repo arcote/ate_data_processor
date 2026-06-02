@@ -103,8 +103,9 @@ class ATEReportApp:
         self.status_var      = tk.StringVar(value="Select an input data folder to begin.")
         self.progress_var    = tk.DoubleVar(value=0.0)
 
-        self.param_vars = {}   # parameter name -> BooleanVar
-        self.cond_vars  = {}   # condition name -> BooleanVar
+        self.param_vars      = {}   # parameter name -> BooleanVar
+        self.param_unit_vars = {}   # parameter name -> StringVar (Y-axis unit)
+        self.cond_vars       = {}   # condition name -> BooleanVar
         self.plot_vars  = {p: tk.BooleanVar(value=True) for p in PLOT_LABELS}
 
         self.out_xlsx_var = tk.BooleanVar(value=True)
@@ -267,11 +268,11 @@ class ATEReportApp:
         self.high_entry = ttk.Entry(ctl, textvariable=self.limit_high_var, width=9)
         self.high_entry.grid(row=0, column=7, padx=(0, 12))
 
-        ttk.Label(ctl, text="Y unit:").grid(row=0, column=8, padx=(0, 4))
+        ttk.Label(ctl, text="Y unit (all):").grid(row=0, column=8, padx=(0, 4))
         self.unit_entry = ttk.Entry(ctl, textvariable=self.y_unit_var, width=6)
         self.unit_entry.grid(row=0, column=9, padx=(0, 4))
-        ttk.Label(ctl, text="(blank=auto)", foreground="#888888").grid(
-            row=0, column=10, padx=(0, 12))
+        ttk.Label(ctl, text="(per-param above wins)",
+                  foreground="#888888").grid(row=0, column=10, padx=(0, 12))
 
         ttk.Checkbutton(ctl, text="Value table", variable=self.show_table_var).grid(
             row=0, column=11)
@@ -302,7 +303,10 @@ class ATEReportApp:
             return None
 
     def _boltzmann_opts(self):
-        """Collect the Boltzmann controls into a kwargs dict for the plotter."""
+        """Collect the Boltzmann controls into a kwargs dict for the plotter.
+
+        Per-parameter Y units from the Parameters panel win; the Boltzmann tab's
+        Y-unit field acts as a global fallback (stored under the '*' key)."""
         mode = self.limit_mode_var.get()
         opts = {
             "limit_mode": mode,
@@ -313,9 +317,14 @@ class ATEReportApp:
         if mode == "fixed":
             opts["limits"] = (self._parse_float(self.limit_low_var.get()),
                               self._parse_float(self.limit_high_var.get()))
-        unit = self.y_unit_var.get().strip()
-        if unit:
-            opts["units"] = unit
+
+        units = {p: v.get().strip() for p, v in self.param_unit_vars.items()
+                 if v.get().strip()}
+        global_unit = self.y_unit_var.get().strip()
+        if global_unit:
+            units["*"] = global_unit
+        if units:
+            opts["units"] = units
         return opts
 
     # ── Preview rendering ────────────────────────────────────────────────────────
@@ -464,8 +473,7 @@ class ATEReportApp:
         ]
         self.preview_label.configure(text="\n".join(lines))
 
-        self._rebuild_checkboxes(
-            self.param_holder, self.param_vars, preview["parameters"])
+        self._rebuild_param_rows(preview["parameters"])
         self._rebuild_checkboxes(
             self.cond_holder, self.cond_vars, preview["conditions"])
 
@@ -487,6 +495,32 @@ class ATEReportApp:
             var_store[name] = var
             ttk.Checkbutton(holder, text=name, variable=var).grid(
                 row=i // 3, column=i % 3, sticky="w", padx=(0, 12))
+
+    def _rebuild_param_rows(self, names):
+        """Parameter list with a Y-unit entry per row (inferred default, editable)."""
+        holder = self.param_holder
+        for child in holder.winfo_children():
+            child.destroy()
+        self.param_vars.clear()
+        self.param_unit_vars.clear()
+        if not names:
+            self._placeholder(holder, "none detected")
+            return
+
+        ttk.Label(holder, text="Parameter",
+                  foreground="#888888").grid(row=0, column=0, sticky="w")
+        ttk.Label(holder, text="Y unit",
+                  foreground="#888888").grid(row=0, column=1, sticky="w", padx=(8, 0))
+        for i, name in enumerate(names, start=1):
+            chk_var = tk.BooleanVar(value=True)
+            self.param_vars[name] = chk_var
+            ttk.Checkbutton(holder, text=name, variable=chk_var).grid(
+                row=i, column=0, sticky="w")
+
+            unit_var = tk.StringVar(value=visualize.infer_unit(name))
+            self.param_unit_vars[name] = unit_var
+            ttk.Entry(holder, textvariable=unit_var, width=6).grid(
+                row=i, column=1, sticky="w", padx=(8, 0), pady=1)
 
     # ── Run (background) ─────────────────────────────────────────────────────────
 
