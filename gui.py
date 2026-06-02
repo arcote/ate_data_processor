@@ -116,6 +116,16 @@ class ATEReportApp:
         self.theme_var      = tk.StringVar(value=visualize.DEFAULT_THEME)
         self.theme_var.trace_add("write", lambda *_: self._refresh_previews())
 
+        # Per-plot Boltzmann controls
+        self.limit_mode_var = tk.StringVar(value="sigma")
+        self.sigma_k_var    = tk.DoubleVar(value=3.0)
+        self.limit_low_var  = tk.StringVar(value="")
+        self.limit_high_var = tk.StringVar(value="")
+        self.y_unit_var     = tk.StringVar(value="")   # blank = infer
+        self.show_table_var = tk.BooleanVar(value=True)
+        for v in (self.limit_mode_var, self.sigma_k_var, self.show_table_var):
+            v.trace_add("write", lambda *_: self._on_bz_opt_change())
+
         # Preview state — holds the rendered PhotoImage refs so Tk doesn't
         # garbage-collect them, the cached demo DataFrame, and a temp dir.
         self._preview_dir = Path(tempfile.mkdtemp(prefix="ate_preview_"))
@@ -222,16 +232,91 @@ class ATEReportApp:
             ttk.Checkbutton(top, text=f"Include {label}",
                             variable=self.plot_vars[key]).grid(
                 row=0, column=0, sticky="w")
-            ttk.Label(top, text="(more adjustments coming)",
-                      foreground="#888888").grid(row=0, column=1, sticky="w",
-                                                  padx=(12, 0))
+
+            preview_row = 1
+            if key == "boltzmann":
+                self._build_boltzmann_controls(tab, row=1)
+                preview_row = 2
 
             preview = ttk.Label(tab, text="rendering preview…",
                                 anchor="center", relief="sunken",
                                 background="#f0f0f0")
-            preview.grid(row=1, column=0, sticky="nsew", pady=(8, 0))
-            tab.rowconfigure(1, weight=1)
+            preview.grid(row=preview_row, column=0, sticky="nsew", pady=(8, 0))
+            tab.rowconfigure(preview_row, weight=1)
             self._preview_labels[key] = preview
+
+    def _build_boltzmann_controls(self, tab, row):
+        ctl = ttk.Frame(tab)
+        ctl.grid(row=row, column=0, sticky="ew", pady=(6, 0))
+
+        ttk.Label(ctl, text="Limits:").grid(row=0, column=0, padx=(0, 4))
+        self.limit_combo = ttk.Combobox(
+            ctl, textvariable=self.limit_mode_var, values=visualize.LIMIT_MODES,
+            width=8, state="readonly")
+        self.limit_combo.grid(row=0, column=1, padx=(0, 12))
+
+        ttk.Label(ctl, text="k·σ:").grid(row=0, column=2, padx=(0, 4))
+        self.sigma_spin = ttk.Spinbox(ctl, from_=0.5, to=10, increment=0.5,
+                                      width=5, textvariable=self.sigma_k_var)
+        self.sigma_spin.grid(row=0, column=3, padx=(0, 12))
+
+        ttk.Label(ctl, text="Low:").grid(row=0, column=4, padx=(0, 4))
+        self.low_entry = ttk.Entry(ctl, textvariable=self.limit_low_var, width=9)
+        self.low_entry.grid(row=0, column=5, padx=(0, 8))
+        ttk.Label(ctl, text="High:").grid(row=0, column=6, padx=(0, 4))
+        self.high_entry = ttk.Entry(ctl, textvariable=self.limit_high_var, width=9)
+        self.high_entry.grid(row=0, column=7, padx=(0, 12))
+
+        ttk.Label(ctl, text="Y unit:").grid(row=0, column=8, padx=(0, 4))
+        self.unit_entry = ttk.Entry(ctl, textvariable=self.y_unit_var, width=6)
+        self.unit_entry.grid(row=0, column=9, padx=(0, 4))
+        ttk.Label(ctl, text="(blank=auto)", foreground="#888888").grid(
+            row=0, column=10, padx=(0, 12))
+
+        ttk.Checkbutton(ctl, text="Value table", variable=self.show_table_var).grid(
+            row=0, column=11)
+
+        # Re-render the preview when the text fields are committed.
+        for entry in (self.low_entry, self.high_entry, self.unit_entry):
+            entry.bind("<Return>",  lambda e: self._on_bz_opt_change())
+            entry.bind("<FocusOut>", lambda e: self._on_bz_opt_change())
+
+        self._update_bz_control_states()
+
+    def _update_bz_control_states(self):
+        """Enable only the limit inputs relevant to the chosen mode."""
+        mode = self.limit_mode_var.get()
+        self.sigma_spin.configure(state="normal" if mode == "sigma" else "disabled")
+        fixed = "normal" if mode == "fixed" else "disabled"
+        self.low_entry.configure(state=fixed)
+        self.high_entry.configure(state=fixed)
+
+    def _on_bz_opt_change(self):
+        self._update_bz_control_states()
+        self._refresh_previews()
+
+    def _parse_float(self, s):
+        try:
+            return float(s)
+        except (TypeError, ValueError):
+            return None
+
+    def _boltzmann_opts(self):
+        """Collect the Boltzmann controls into a kwargs dict for the plotter."""
+        mode = self.limit_mode_var.get()
+        opts = {
+            "limit_mode": mode,
+            "sigma_k":    self._parse_float(self.sigma_k_var.get()) or 3.0,
+            "show_table": bool(self.show_table_var.get()),
+            "show_title": False,
+        }
+        if mode == "fixed":
+            opts["limits"] = (self._parse_float(self.limit_low_var.get()),
+                              self._parse_float(self.limit_high_var.get()))
+        unit = self.y_unit_var.get().strip()
+        if unit:
+            opts["units"] = unit
+        return opts
 
     # ── Preview rendering ────────────────────────────────────────────────────────
 
@@ -242,21 +327,23 @@ class ATEReportApp:
         if self._preview_thread is not None and self._preview_thread.is_alive():
             return
         theme_name = self.theme_var.get()
+        bopts = self._boltzmann_opts()
         for lbl in self._preview_labels.values():
             lbl.configure(text=f"rendering ({theme_name}) preview…", image="")
         self._preview_thread = threading.Thread(
-            target=self._render_previews_worker, args=(theme_name,), daemon=True)
+            target=self._render_previews_worker, args=(theme_name, bopts),
+            daemon=True)
         self._preview_thread.start()
 
-    def _render_previews_worker(self, theme_name):
+    def _render_previews_worker(self, theme_name, bopts):
         try:
             preview_df = visualize.enrich(self._preview_df)
-            preview_df = preview_df.rename(columns={"parameter": "parameter"})
             # The Boltzmann plot names its file after the parameter; the demo
             # dataset uses a single parameter named "Demo".
             visualize.generate_plots(
                 preview_df, list(PLOT_LABELS), str(self._preview_dir),
-                fmt="png", dpi=80, theme=theme_name, log=lambda *_: None)
+                fmt="png", dpi=80, theme=theme_name, log=lambda *_: None,
+                boltzmann_opts=bopts)
             for key, fname in PLOT_FILE.items():
                 path = self._preview_dir / fname
                 if path.exists():
@@ -466,6 +553,7 @@ class ATEReportApp:
             "img_format": self.img_format_var.get(),
             "dpi": int(self.dpi_var.get()),
             "theme": self.theme_var.get(),
+            "boltzmann_opts": self._boltzmann_opts(),
         }
 
     def _run_worker(self, cfg):
@@ -549,7 +637,8 @@ class ATEReportApp:
                 df, cfg["plots"], str(plot_dir),
                 fmt=cfg["img_format"], dpi=cfg["dpi"],
                 theme=cfg["theme"], log=log,
-                progress_callback=phase_progress(step))
+                progress_callback=phase_progress(step),
+                boltzmann_opts=cfg.get("boltzmann_opts"))
             written.append(str(plot_dir))
             base[0] += step
             self._post("progress", base[0])

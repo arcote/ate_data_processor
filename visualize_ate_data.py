@@ -79,6 +79,7 @@ THEMES = {
         "whisker":      "#8891aa",
         "heatmap_cmap": "YlOrRd",
         "heatmap_line": "#ffffff",
+        "limit":        "#d9534f",
         "temp_palette": TEMP_PALETTE,
         "default_color": DEFAULT_COLOR,
     },
@@ -97,11 +98,71 @@ THEMES = {
         "whisker":      "#aab1c4",
         "heatmap_cmap": "magma",
         "heatmap_line": "#0f1117",
+        "limit":        "#ff6b6b",
         "temp_palette": {"COLD": "#5fa8ff", "ROOM": "#ff6fc8", "HOT": "#34d4be"},
         "default_color": "#bbbbbb",
     },
 }
 DEFAULT_THEME = "light"
+
+# Limit-line modes available to the Boltzmann plot.
+LIMIT_MODES = ["sigma", "minmax", "fixed", "none"]
+
+# Heuristic unit inference from a parameter name. Voltage-like names map to V,
+# current-like names to A; anything else is left unitless. Always overridable.
+def infer_unit(parameter: str) -> str:
+    p = (parameter or "").lower()
+    if p.startswith("bv") or p.startswith("v") or "vces" in p or "vds" in p or "vth" in p:
+        return "V"
+    if p.startswith("id") or p.startswith("ig") or p.startswith("i") or "iss" in p:
+        return "A"
+    return ""
+
+
+def resolve_unit(parameter, units):
+    """units: None | str (applies to all) | dict(param->unit, '*'->unit)."""
+    if units is None:
+        return infer_unit(parameter)
+    if isinstance(units, str):
+        return units
+    if parameter in units:
+        return units[parameter]
+    if "*" in units:
+        return units["*"]
+    return infer_unit(parameter)
+
+
+def compute_limits(values, mode="sigma", sigma_k=3.0, fixed=None):
+    """
+    Return (low, high) limit values for a series, or (None, None) for 'none'.
+
+    mode:
+      "sigma"  — mean ± sigma_k·std
+      "minmax" — observed min / max
+      "fixed"  — the (low, high) tuple in ``fixed`` (either entry may be None)
+      "none"   — no limits
+    """
+    s = pd.Series(values).dropna()
+    if mode == "none" or s.empty:
+        return (None, None)
+    if mode == "fixed":
+        if not fixed:
+            return (None, None)
+        return (fixed[0], fixed[1])
+    if mode == "minmax":
+        return (float(s.min()), float(s.max()))
+    # default: sigma
+    m, sd = float(s.mean()), float(s.std() or 0.0)
+    return (m - sigma_k * sd, m + sigma_k * sd)
+
+
+def resolve_limit_pair(parameter, limits):
+    """limits: None | (low,high) | dict(param->(low,high), '*'->(low,high))."""
+    if limits is None:
+        return None
+    if isinstance(limits, dict):
+        return limits.get(parameter, limits.get("*"))
+    return limits  # a bare (low, high) tuple applies to all parameters
 
 
 def get_theme(theme):
@@ -207,17 +268,75 @@ def apply_base_style(theme=None):
 # Plot 1 — Boltzmann Scatter (reference format)
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _draw_value_table(ax_tbl, sub, order, palette, theme, unit, max_rows=30):
+    """Render a per-unit value table (run # × condition) on a blank axis."""
+    ax_tbl.axis("off")
+    pivot = sub.pivot_table(index="run_number", columns="temp_cond",
+                            values=VALUE_COL, aggfunc="mean")
+    pivot = pivot.reindex(columns=[c for c in order if c in pivot.columns])
+    runs = [r for r in pivot.index.tolist() if pd.notna(r)][:max_rows]
+
+    def fmt(v):
+        return "" if pd.isna(v) else f"{v:.3g}"
+
+    col_labels = ["Unit"] + list(pivot.columns)
+    cell_text = [[str(int(r))] + [fmt(pivot.loc[r, c]) for c in pivot.columns]
+                 for r in runs]
+    if not cell_text:
+        return
+
+    tbl = ax_tbl.table(cellText=cell_text, colLabels=col_labels,
+                       loc="center", cellLoc="center")
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(7)
+    tbl.scale(1.0, 1.05)
+
+    ncols = len(col_labels)
+    for (r, c), cell in tbl.get_celld().items():
+        cell.set_edgecolor(theme["axes_edge"])
+        cell.set_facecolor(theme["axes_face"])
+        cell.get_text().set_color(theme["text"])
+        if r == 0:  # header row
+            cell.set_facecolor(theme["legend_face"])
+            cell.get_text().set_fontweight("bold")
+            if c >= 1:  # colour the condition headers
+                cond = col_labels[c]
+                cell.get_text().set_color(palette.get(cond, theme["default_color"]))
+    unit_suffix = f" ({unit})" if unit else ""
+    ax_tbl.set_title(f"Values{unit_suffix}", fontsize=8,
+                     color=theme["text"], pad=4)
+
+
 def plot_boltzmann(df: pd.DataFrame, out_dir: str, fmt: str, dpi: int = 150,
-                   theme=None, log=print):
-    """One scatter strip per temp condition, x-axis is temperature (°C)."""
+                   theme=None, log=print, limit_mode="sigma", sigma_k=3.0,
+                   limits=None, units=None, show_title=False, show_table=True):
+    """
+    One scatter strip per temp condition, x-axis is Temperature (°C).
+
+    limit_mode : "sigma" | "minmax" | "fixed" | "none"  — how the high/low
+                 limit lines are derived (see compute_limits).
+    sigma_k    : multiplier for the "sigma" mode.
+    limits     : for "fixed" mode — (low, high) or {param: (low, high)} / {"*": ...}.
+    units      : y-axis unit — str (all), {param: unit}, or None to infer.
+    show_title : draw the "Boltzmann Scatter — <param>" title (default off).
+    show_table : render the per-unit value table to the right of the plot.
+    """
     t = get_theme(theme)
     palette = t["temp_palette"]
     params = df["parameter"].unique()
 
     for param in params:
         sub = df[df["parameter"] == param].copy()
+        unit = resolve_unit(param, units)
 
-        fig, ax = plt.subplots(figsize=(10, 4.5))
+        if show_table:
+            fig = plt.figure(figsize=(13, 4.6))
+            gs = fig.add_gridspec(1, 2, width_ratios=[3.0, 1.0], wspace=0.04)
+            ax = fig.add_subplot(gs[0, 0])
+            ax_tbl = fig.add_subplot(gs[0, 1])
+        else:
+            fig, ax = plt.subplots(figsize=(10, 4.5))
+            ax_tbl = None
         fig.patch.set_facecolor(t["fig_face"])
 
         jitter = 1.2   # x-axis spread for visual separation of overlapping dots
@@ -237,22 +356,46 @@ def plot_boltzmann(df: pd.DataFrame, out_dir: str, fmt: str, dpi: int = 150,
                 label=cond,
             )
 
-        ax.set_xlabel("Temperature (°C)", fontsize=10)
-        ax.set_ylabel(f"{param}\n(extracted value)", fontsize=10)
-        ax.set_title(f"Boltzmann Scatter — {param}", fontsize=12, pad=10)
+        # ── Limit lines (high / low) ──────────────────────────────────────────
+        fixed_pair = resolve_limit_pair(param, limits)
+        low, high = compute_limits(sub[VALUE_COL], mode=limit_mode,
+                                   sigma_k=sigma_k, fixed=fixed_pair)
+        for val, name in ((low, "Low limit"), (high, "High limit")):
+            if val is not None:
+                ax.axhline(val, color=t["limit"], lw=1.4, ls="--",
+                           alpha=0.9, zorder=2, label=name)
 
-        # X-axis: show only the three temp positions
-        used_temps = sorted(sub["temp_cond"].unique(), key=lambda t: TEMP_AXIS_MAP.get(t, 0))
-        ax.set_xticks([TEMP_AXIS_MAP[t] for t in used_temps])
-        ax.set_xticklabels([f"{TEMP_AXIS_MAP[t]} °C\n({t})" for t in used_temps])
-        ax.set_xlim(min(TEMP_AXIS_MAP[t] for t in used_temps) - 15,
-                    max(TEMP_AXIS_MAP[t] for t in used_temps) + 15)
+        ax.set_xlabel("Temperature (°C)", fontsize=10)
+        ylabel = f"{param}\n({unit})" if unit else f"{param}\n(extracted value)"
+        ax.set_ylabel(ylabel, fontsize=10)
+        if show_title:
+            ax.set_title(f"Boltzmann Scatter — {param}", fontsize=12, pad=10)
+
+        # X-axis: show only the temp positions present
+        used_temps = sorted(sub["temp_cond"].unique(),
+                            key=lambda c: TEMP_AXIS_MAP.get(c, 0))
+        ax.set_xticks([TEMP_AXIS_MAP[c] for c in used_temps])
+        ax.set_xticklabels([f"{TEMP_AXIS_MAP[c]} °C\n({c})" for c in used_temps])
+        ax.set_xlim(min(TEMP_AXIS_MAP[c] for c in used_temps) - 15,
+                    max(TEMP_AXIS_MAP[c] for c in used_temps) + 15)
+
+        # Y-axis limits: encompass the data *and* the limit lines, with padding.
+        y_candidates = [sub[VALUE_COL].min(), sub[VALUE_COL].max()]
+        y_candidates += [v for v in (low, high) if v is not None]
+        ymin, ymax = min(y_candidates), max(y_candidates)
+        pad = (ymax - ymin) * 0.08 or (abs(ymax) * 0.08 or 1.0)
+        ax.set_ylim(ymin - pad, ymax + pad)
 
         handles, labels = ax.get_legend_handles_labels()
         by_label = dict(zip(labels, handles))
-        ax.legend(by_label.values(), by_label.keys(), loc="upper left")
+        ax.legend(by_label.values(), by_label.keys(), loc="upper left", fontsize=8)
 
-        fig.tight_layout()
+        if ax_tbl is not None:
+            _draw_value_table(ax_tbl, sub, used_temps, palette, t, unit)
+        else:
+            # tight_layout is unreliable with the table's gridspec; savefig's
+            # bbox_inches="tight" handles the table case.
+            fig.tight_layout()
         save_fig(fig, out_dir, f"1_boltzmann_{param}", fmt, dpi=dpi,
                  facecolor=t["fig_face"], log=log)
         plt.close(fig)
@@ -483,12 +626,14 @@ _PLOT_FUNCS = {
 
 
 def generate_plots(df, plots, out_dir, fmt="png", dpi=150, theme=None,
-                   log=print, progress_callback=None):
+                   log=print, progress_callback=None, boltzmann_opts=None):
     """
     Generate the requested plots from an enriched DataFrame.
 
     plots: iterable of names from ALL_PLOTS.
     theme: a name in THEMES (e.g. "light", "dark") or a custom theme dict.
+    boltzmann_opts: extra kwargs forwarded only to plot_boltzmann (limit_mode,
+                    sigma_k, limits, units, show_title, show_table).
     Applies the base style, then runs each selected plot. progress_callback(
     done, total) fires after each plot type. Returns the list of plots run.
     """
@@ -498,7 +643,11 @@ def generate_plots(df, plots, out_dir, fmt="png", dpi=150, theme=None,
     total = len(selected)
     for i, name in enumerate(selected, 1):
         log(f"[{i}/{total}] {name}...")
-        _PLOT_FUNCS[name](df, out_dir, fmt, dpi=dpi, theme=t, log=log)
+        if name == "boltzmann":
+            plot_boltzmann(df, out_dir, fmt, dpi=dpi, theme=t, log=log,
+                           **(boltzmann_opts or {}))
+        else:
+            _PLOT_FUNCS[name](df, out_dir, fmt, dpi=dpi, theme=t, log=log)
         if progress_callback is not None:
             progress_callback(i, total)
     return selected
@@ -533,6 +682,34 @@ def main():
         help=f"Color theme for the plots (default: {DEFAULT_THEME})"
     )
     parser.add_argument(
+        "--limit-mode", default="sigma", choices=LIMIT_MODES,
+        help="Boltzmann high/low limit lines source (default: sigma)"
+    )
+    parser.add_argument(
+        "--sigma-k", type=float, default=3.0,
+        help="Sigma multiplier for --limit-mode sigma (default: 3.0)"
+    )
+    parser.add_argument(
+        "--limit-low", type=float, default=None,
+        help="Fixed low limit (with --limit-mode fixed), applied to all params"
+    )
+    parser.add_argument(
+        "--limit-high", type=float, default=None,
+        help="Fixed high limit (with --limit-mode fixed), applied to all params"
+    )
+    parser.add_argument(
+        "--y-unit", default=None,
+        help="Override the Boltzmann y-axis unit for all params (blank = infer)"
+    )
+    parser.add_argument(
+        "--no-table", action="store_true",
+        help="Hide the per-unit value table next to the Boltzmann plot"
+    )
+    parser.add_argument(
+        "--show-title", action="store_true",
+        help="Show the 'Boltzmann Scatter — …' title (hidden by default)"
+    )
+    parser.add_argument(
         "--plots", default="all",
         help=(
             "Comma-separated list of plots to generate: "
@@ -553,8 +730,18 @@ def main():
         else [p.strip().lower() for p in args.plots.split(",")]
     )
 
+    boltzmann_opts = {
+        "limit_mode": args.limit_mode,
+        "sigma_k":    args.sigma_k,
+        "limits":     (args.limit_low, args.limit_high)
+                      if args.limit_mode == "fixed" else None,
+        "units":      args.y_unit or None,
+        "show_table": not args.no_table,
+        "show_title": args.show_title,
+    }
     generate_plots(df, requested, args.output_dir, args.format,
-                   dpi=args.dpi, theme=args.theme)
+                   dpi=args.dpi, theme=args.theme,
+                   boltzmann_opts=boltzmann_opts)
 
     print("\nAll done.")
 
