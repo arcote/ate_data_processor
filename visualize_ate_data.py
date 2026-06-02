@@ -269,7 +269,12 @@ def apply_base_style(theme=None):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _draw_value_table(ax_tbl, sub, order, palette, theme, unit, max_rows=30):
-    """Render a per-unit value table (run # × condition) on a blank axis."""
+    """Render a per-unit value table (run # × condition) on a blank axis.
+
+    Units, when known, are placed in the condition column headers
+    (e.g. "COLD (V)") rather than a separate axis title — a separate title
+    was prone to overlapping the table when many rows were rendered.
+    """
     ax_tbl.axis("off")
     pivot = sub.pivot_table(index="run_number", columns="temp_cond",
                             values=VALUE_COL, aggfunc="mean")
@@ -279,8 +284,10 @@ def _draw_value_table(ax_tbl, sub, order, palette, theme, unit, max_rows=30):
     def fmt(v):
         return "" if pd.isna(v) else f"{v:.3g}"
 
-    col_labels = ["Unit"] + list(pivot.columns)
-    cell_text = [[str(int(r))] + [fmt(pivot.loc[r, c]) for c in pivot.columns]
+    unit_suffix = f" ({unit})" if unit else ""
+    raw_cond_cols = list(pivot.columns)
+    col_labels = ["Unit"] + [f"{c}{unit_suffix}" for c in raw_cond_cols]
+    cell_text = [[str(int(r))] + [fmt(pivot.loc[r, c]) for c in raw_cond_cols]
                  for r in runs]
     if not cell_text:
         return
@@ -291,7 +298,6 @@ def _draw_value_table(ax_tbl, sub, order, palette, theme, unit, max_rows=30):
     tbl.set_fontsize(7)
     tbl.scale(1.0, 1.05)
 
-    ncols = len(col_labels)
     for (r, c), cell in tbl.get_celld().items():
         cell.set_edgecolor(theme["axes_edge"])
         cell.set_facecolor(theme["axes_face"])
@@ -299,12 +305,9 @@ def _draw_value_table(ax_tbl, sub, order, palette, theme, unit, max_rows=30):
         if r == 0:  # header row
             cell.set_facecolor(theme["legend_face"])
             cell.get_text().set_fontweight("bold")
-            if c >= 1:  # colour the condition headers
-                cond = col_labels[c]
+            if c >= 1:  # colour each condition header with its palette colour
+                cond = raw_cond_cols[c - 1]
                 cell.get_text().set_color(palette.get(cond, theme["default_color"]))
-    unit_suffix = f" ({unit})" if unit else ""
-    ax_tbl.set_title(f"Values{unit_suffix}", fontsize=8,
-                     color=theme["text"], pad=4)
 
 
 def plot_boltzmann(df: pd.DataFrame, out_dir: str, fmt: str, dpi: int = 150,
@@ -363,10 +366,26 @@ def plot_boltzmann(df: pd.DataFrame, out_dir: str, fmt: str, dpi: int = 150,
         fixed_pair = resolve_limit_pair(param, limits)
         low, high = compute_limits(sub[VALUE_COL], mode=limit_mode,
                                    sigma_k=sigma_k, fixed=fixed_pair)
-        for val, name in ((low, "Low limit"), (high, "High limit")):
+
+        # Label tells the reader what the limit derives from. For sigma we
+        # show the formula (k·σ); for minmax the source; for fixed the value
+        # itself (which is the same across parameters).
+        def _limit_label(side, val):
+            base = f"{side} limit"
+            if limit_mode == "sigma":
+                k = f"{sigma_k:g}"
+                sign = "−" if side == "Low" else "+"
+                return f"{base} (μ{sign}{k}σ)"
+            if limit_mode == "minmax":
+                return f"{base} ({'min' if side == 'Low' else 'max'})"
+            if limit_mode == "fixed":
+                return f"{base} ({val:.3g}{' ' + unit if unit else ''})"
+            return base
+
+        for side, val in (("Low", low), ("High", high)):
             if val is not None:
                 ax.axhline(val, color=t["limit"], lw=1.4, ls="--",
-                           alpha=0.9, zorder=2, label=name)
+                           alpha=0.9, zorder=2, label=_limit_label(side, val))
 
         ax.set_xlabel("Temperature (°C)", fontsize=10)
         ylabel = f"{param}\n({unit})" if unit else f"{param}\n(extracted value)"
