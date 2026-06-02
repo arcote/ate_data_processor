@@ -1,0 +1,450 @@
+"""
+visualize_ate_data.py
+---------------------
+Reads the output CSV from extract_ate_data.py and produces multiple
+publication-quality plots for ATE test data review.
+
+Usage:
+    python visualize_ate_data.py --input results.csv
+    python visualize_ate_data.py --input results.csv --output-dir ./plots --format pdf
+
+Plots generated (all saved + shown interactively):
+  1. Boltzmann scatter    — mirrors the reference format; one strip per temp condition
+  2. Box-and-whisker      — distribution spread per parameter × temp condition
+  3. Run trend            — value vs. run number per temp condition (drift/stability check)
+  4. Heat map             — mean value grid: test iteration × temp condition
+  5. Histogram overlay    — distribution shape per temp condition, all params together
+
+Requirements:
+    pip install pandas matplotlib seaborn scipy
+"""
+
+import argparse
+import os
+import sys
+import re
+import warnings
+
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
+import seaborn as sns
+
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+# ── Temp-condition colour palette (matches reference plot aesthetic) ─────────
+TEMP_PALETTE = {
+    "COLD": "#3a7abf",   # medium blue  (matches reference left cluster)
+    "ROOM": "#e040a0",   # vivid pink   (matches reference centre cluster)
+    "HOT":  "#00a898",   # teal-green   (matches reference right cluster)
+}
+DEFAULT_COLOR = "#999999"
+
+# ── Approximate temperature axis positions for Boltzmann plot ────────────────
+TEMP_AXIS_MAP = {
+    "COLD": -40,
+    "ROOM":  25,
+    "HOT":   85,
+}
+
+# Map column 4 dtype
+VALUE_COL = "extracted_value"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def detect_temp_condition(temp_folder: str) -> str:
+    """Return 'COLD', 'ROOM', or 'HOT' from a folder name like 'Idss_EN5_COLD'."""
+    upper = temp_folder.upper()
+    for key in ("COLD", "HOT", "ROOM"):
+        if key in upper:
+            return key
+    return "ROOM"
+
+
+def detect_parameter(temp_folder: str) -> str:
+    """
+    Extract parameter name from folder like 'Idss_EN5_COLD' → 'Idss_EN5'.
+    Strips trailing _COLD / _HOT / _ROOM suffix.
+    """
+    return re.sub(r"_(COLD|HOT|ROOM)$", "", temp_folder, flags=re.IGNORECASE)
+
+
+def load_and_enrich(csv_path: str) -> pd.DataFrame:
+    df = pd.read_csv(csv_path)
+
+    required = {"test_folder", "temp_folder", "run_number", VALUE_COL}
+    missing  = required - set(df.columns)
+    if missing:
+        sys.exit(f"[ERROR] Input CSV is missing columns: {missing}\n"
+                 f"       Expected columns: {required}")
+
+    df[VALUE_COL]     = pd.to_numeric(df[VALUE_COL], errors="coerce")
+    df["run_number"]  = pd.to_numeric(df["run_number"], errors="coerce")
+    df["temp_cond"]   = df["temp_folder"].apply(detect_temp_condition)
+    df["parameter"]   = df["temp_folder"].apply(detect_parameter)
+    df["temp_x"]      = df["temp_cond"].map(TEMP_AXIS_MAP)
+    df["color"]       = df["temp_cond"].map(TEMP_PALETTE).fillna(DEFAULT_COLOR)
+    df.dropna(subset=[VALUE_COL], inplace=True)
+
+    return df
+
+
+def save_fig(fig, out_dir: str, name: str, fmt: str):
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, f"{name}.{fmt}")
+    fig.savefig(path, dpi=150, bbox_inches="tight", facecolor="#ffffff")
+    print(f"  Saved → {path}")
+
+
+def apply_base_style():
+    plt.rcParams.update({
+        "figure.facecolor":  "#ffffff",
+        "axes.facecolor":    "#f7f8fc",
+        "axes.edgecolor":    "#cccccc",
+        "axes.labelcolor":   "#222222",
+        "axes.titlecolor":   "#111111",
+        "axes.grid":         True,
+        "grid.color":        "#e0e0e0",
+        "grid.linewidth":    0.7,
+        "xtick.color":       "#444444",
+        "ytick.color":       "#444444",
+        "text.color":        "#222222",
+        "legend.facecolor":  "#ffffff",
+        "legend.edgecolor":  "#cccccc",
+        "legend.labelcolor": "#222222",
+        "font.family":       "monospace",
+        "font.size":         9,
+    })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Plot 1 — Boltzmann Scatter (reference format)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def plot_boltzmann(df: pd.DataFrame, out_dir: str, fmt: str):
+    """One scatter strip per temp condition, x-axis is temperature (°C)."""
+    params = df["parameter"].unique()
+
+    for param in params:
+        sub = df[df["parameter"] == param].copy()
+
+        fig, ax = plt.subplots(figsize=(10, 4.5))
+        fig.patch.set_facecolor("#0f1117")
+
+        jitter = 1.2   # x-axis spread for visual separation of overlapping dots
+
+        for cond, grp in sub.groupby("temp_cond"):
+            x_base = TEMP_AXIS_MAP.get(cond, 25)
+            x_jitter = grp["run_number"].rank(method="first") * 0 + x_base  # no jitter unless needed
+            # Light horizontal jitter so overlapping points separate
+            import numpy as np
+            rng = len(grp)
+            x_jitter = x_base + (grp["run_number"].values - grp["run_number"].mean()) / max(grp["run_number"].std() or 1, 1) * jitter
+
+            ax.scatter(
+                x_jitter,
+                grp[VALUE_COL],
+                c=TEMP_PALETTE.get(cond, DEFAULT_COLOR),
+                alpha=0.75,
+                s=28,
+                zorder=3,
+                label=cond,
+            )
+
+        ax.set_xlabel("Temperature (°C)", fontsize=10)
+        ax.set_ylabel(f"{param}\n(extracted value)", fontsize=10)
+        ax.set_title(f"Boltzmann Scatter — {param}", fontsize=12, pad=10)
+
+        # X-axis: show only the three temp positions
+        used_temps = sorted(sub["temp_cond"].unique(), key=lambda t: TEMP_AXIS_MAP.get(t, 0))
+        ax.set_xticks([TEMP_AXIS_MAP[t] for t in used_temps])
+        ax.set_xticklabels([f"{TEMP_AXIS_MAP[t]} °C\n({t})" for t in used_temps])
+        ax.set_xlim(min(TEMP_AXIS_MAP[t] for t in used_temps) - 15,
+                    max(TEMP_AXIS_MAP[t] for t in used_temps) + 15)
+
+        handles, labels = ax.get_legend_handles_labels()
+        by_label = dict(zip(labels, handles))
+        ax.legend(by_label.values(), by_label.keys(), loc="upper left")
+
+        fig.tight_layout()
+        save_fig(fig, out_dir, f"1_boltzmann_{param}", fmt)
+        plt.show()
+        plt.close(fig)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Plot 2 — Box-and-Whisker
+# ─────────────────────────────────────────────────────────────────────────────
+
+def plot_boxplot(df: pd.DataFrame, out_dir: str, fmt: str):
+    """Distribution spread per parameter × temperature condition."""
+    params = df["parameter"].unique()
+    n = len(params)
+    ncols = min(3, n)
+    nrows = (n + ncols - 1) // ncols
+
+    fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 4.5 * nrows), squeeze=False)
+    fig.patch.set_facecolor("#0f1117")
+    fig.suptitle("Box-and-Whisker: Value Distribution per Condition", fontsize=13, y=1.01)
+
+    for idx, param in enumerate(params):
+        ax = axes[idx // ncols][idx % ncols]
+        sub = df[df["parameter"] == param]
+
+        order  = [c for c in ("COLD", "ROOM", "HOT") if c in sub["temp_cond"].unique()]
+        colors = [TEMP_PALETTE.get(c, DEFAULT_COLOR) for c in order]
+
+        bp = ax.boxplot(
+            [sub[sub["temp_cond"] == c][VALUE_COL].values for c in order],
+            patch_artist=True,
+            notch=False,
+            widths=0.45,
+            medianprops=dict(color="#ffffff", linewidth=1.8),
+            whiskerprops=dict(color="#8891aa"),
+            capprops=dict(color="#8891aa"),
+            flierprops=dict(marker="o", markersize=3, alpha=0.5),
+        )
+        for patch, color in zip(bp["boxes"], colors):
+            patch.set_facecolor(color)
+            patch.set_alpha(0.7)
+        for flier, color in zip(bp["fliers"], colors):
+            flier.set_markerfacecolor(color)
+
+        ax.set_xticklabels(order)
+        ax.set_title(param, fontsize=9)
+        ax.set_ylabel("Value", fontsize=8)
+        ax.set_xlabel("Temp Condition", fontsize=8)
+
+    # Hide unused axes
+    for idx in range(n, nrows * ncols):
+        axes[idx // ncols][idx % ncols].set_visible(False)
+
+    fig.tight_layout()
+    save_fig(fig, out_dir, "2_boxplot", fmt)
+    plt.show()
+    plt.close(fig)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Plot 3 — Run Trend (stability / drift check)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def plot_run_trend(df: pd.DataFrame, out_dir: str, fmt: str):
+    """Value vs. run number — reveals drift, outliers, repeatability issues."""
+    params = df["parameter"].unique()
+    n = len(params)
+    ncols = min(2, n)
+    nrows = (n + ncols - 1) // ncols
+
+    fig, axes = plt.subplots(nrows, ncols, figsize=(7 * ncols, 4 * nrows), squeeze=False)
+    fig.patch.set_facecolor("#0f1117")
+    fig.suptitle("Run Trend: Value vs. Run Number (Drift / Stability)", fontsize=13, y=1.01)
+
+    for idx, param in enumerate(params):
+        ax = axes[idx // ncols][idx % ncols]
+        sub = df[df["parameter"] == param].sort_values("run_number")
+
+        for cond, grp in sub.groupby("temp_cond"):
+            grp_s = grp.sort_values("run_number")
+            color = TEMP_PALETTE.get(cond, DEFAULT_COLOR)
+            ax.plot(
+                grp_s["run_number"], grp_s[VALUE_COL],
+                marker="o", ms=5, lw=1.4,
+                color=color, label=cond, alpha=0.85
+            )
+            # Rolling mean overlay
+            if len(grp_s) >= 4:
+                rolling = grp_s[VALUE_COL].rolling(3, center=True).mean()
+                ax.plot(grp_s["run_number"], rolling,
+                        lw=2.2, ls="--", color=color, alpha=0.45)
+
+        ax.set_title(param, fontsize=9)
+        ax.set_xlabel("Run #", fontsize=8)
+        ax.set_ylabel("Value", fontsize=8)
+        ax.legend(fontsize=7, loc="upper right")
+        ax.xaxis.set_major_locator(mticker.MaxNLocator(integer=True))
+
+    for idx in range(n, nrows * ncols):
+        axes[idx // ncols][idx % ncols].set_visible(False)
+
+    fig.tight_layout()
+    save_fig(fig, out_dir, "3_run_trend", fmt)
+    plt.show()
+    plt.close(fig)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Plot 4 — Heat Map (mean value grid)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def plot_heatmap(df: pd.DataFrame, out_dir: str, fmt: str):
+    """
+    Mean extracted value as a colour grid: rows = parameter×condition,
+    columns = test iteration (3rd/4th/5th test).
+    Good for spotting lot-to-lot or iteration-to-iteration shifts.
+    """
+    df["param_cond"] = df["parameter"] + " | " + df["temp_cond"]
+    pivot = df.pivot_table(
+        index="param_cond",
+        columns="test_folder",
+        values=VALUE_COL,
+        aggfunc="mean"
+    )
+
+    if pivot.empty:
+        print("  [SKIP] Heatmap: not enough variation across test folders.")
+        return
+
+    fig, ax = plt.subplots(figsize=(max(6, len(pivot.columns) * 2.2), max(4, len(pivot) * 0.55 + 1.5)))
+    fig.patch.set_facecolor("#0f1117")
+
+    sns.heatmap(
+        pivot,
+        ax=ax,
+        cmap="YlOrRd",
+        annot=True,
+        fmt=".3g",
+        linewidths=0.4,
+        linecolor="#0f1117",
+        cbar_kws={"shrink": 0.7, "label": "Mean Value"},
+    )
+
+    ax.set_title("Heat Map: Mean Value — Parameter × Condition vs. Test Iteration", fontsize=11, pad=12)
+    ax.set_xlabel("Test Iteration", fontsize=9)
+    ax.set_ylabel("Parameter | Condition", fontsize=9)
+    ax.tick_params(axis="x", rotation=30)
+    ax.tick_params(axis="y", rotation=0)
+
+    fig.tight_layout()
+    save_fig(fig, out_dir, "4_heatmap", fmt)
+    plt.show()
+    plt.close(fig)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Plot 5 — Histogram Overlay
+# ─────────────────────────────────────────────────────────────────────────────
+
+def plot_histograms(df: pd.DataFrame, out_dir: str, fmt: str):
+    """Overlaid histograms per temp condition — shows distribution shape."""
+    params = df["parameter"].unique()
+    n = len(params)
+    ncols = min(2, n)
+    nrows = (n + ncols - 1) // ncols
+
+    fig, axes = plt.subplots(nrows, ncols, figsize=(6.5 * ncols, 4 * nrows), squeeze=False)
+    fig.patch.set_facecolor("#0f1117")
+    fig.suptitle("Histogram Overlay: Value Distribution per Temp Condition", fontsize=13, y=1.01)
+
+    for idx, param in enumerate(params):
+        ax = axes[idx // ncols][idx % ncols]
+        sub = df[df["parameter"] == param]
+        bins = min(20, max(5, len(sub) // 4))
+
+        for cond in ("COLD", "ROOM", "HOT"):
+            grp = sub[sub["temp_cond"] == cond][VALUE_COL].dropna()
+            if grp.empty:
+                continue
+            color = TEMP_PALETTE.get(cond, DEFAULT_COLOR)
+            ax.hist(
+                grp, bins=bins,
+                color=color, alpha=0.55,
+                edgecolor=color, linewidth=0.5,
+                label=f"{cond} (n={len(grp)})"
+            )
+            # Mean line
+            ax.axvline(grp.mean(), color=color, lw=1.8, ls="--", alpha=0.9)
+
+        ax.set_title(param, fontsize=9)
+        ax.set_xlabel("Value", fontsize=8)
+        ax.set_ylabel("Count", fontsize=8)
+        ax.legend(fontsize=7)
+
+    for idx in range(n, nrows * ncols):
+        axes[idx // ncols][idx % ncols].set_visible(False)
+
+    fig.tight_layout()
+    save_fig(fig, out_dir, "5_histogram", fmt)
+    plt.show()
+    plt.close(fig)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Visualize ATE extracted data from extract_ate_data.py output."
+    )
+    parser.add_argument(
+        "--input", default="results.csv",
+        help="Path to the extraction output CSV (default: results.csv)"
+    )
+    parser.add_argument(
+        "--output-dir", default="plots",
+        help="Directory to save plot files (default: ./plots)"
+    )
+    parser.add_argument(
+        "--format", default="png", choices=["png", "pdf", "svg"],
+        help="Output file format (default: png)"
+    )
+    parser.add_argument(
+        "--no-show", action="store_true",
+        help="Skip interactive display — save only (useful for headless/server runs)"
+    )
+    parser.add_argument(
+        "--plots", default="all",
+        help=(
+            "Comma-separated list of plots to generate: "
+            "boltzmann,box,trend,heatmap,histogram  (default: all)"
+        )
+    )
+    args = parser.parse_args()
+
+    if args.no_show:
+        import matplotlib
+        matplotlib.use("Agg")
+
+    apply_base_style()
+
+    print(f"Loading: {args.input}")
+    df = load_and_enrich(args.input)
+    print(f"  {len(df)} rows | {df['parameter'].nunique()} parameters | "
+          f"{df['temp_cond'].nunique()} temp conditions | "
+          f"{df['test_folder'].nunique()} test iterations\n")
+
+    requested = (
+        {"boltzmann", "box", "trend", "heatmap", "histogram"}
+        if args.plots.lower() == "all"
+        else {p.strip().lower() for p in args.plots.split(",")}
+    )
+
+    if "boltzmann" in requested:
+        print("[1/5] Boltzmann scatter...")
+        plot_boltzmann(df, args.output_dir, args.format)
+
+    if "box" in requested:
+        print("[2/5] Box-and-whisker...")
+        plot_boxplot(df, args.output_dir, args.format)
+
+    if "trend" in requested:
+        print("[3/5] Run trend...")
+        plot_run_trend(df, args.output_dir, args.format)
+
+    if "heatmap" in requested:
+        print("[4/5] Heat map...")
+        plot_heatmap(df, args.output_dir, args.format)
+
+    if "histogram" in requested:
+        print("[5/5] Histogram overlay...")
+        plot_histograms(df, args.output_dir, args.format)
+
+    print("\nAll done.")
+
+
+if __name__ == "__main__":
+    main()
