@@ -117,6 +117,9 @@ class ATEReportApp:
         self.theme_var      = tk.StringVar(value=visualize.DEFAULT_THEME)
         self.theme_var.trace_add("write", lambda *_: self._refresh_previews())
 
+        # Per-plot custom title (blank = derive from the parameter / plot name)
+        self.title_vars = {p: tk.StringVar(value="") for p in PLOT_LABELS}
+
         # Per-plot Boltzmann controls
         self.limit_mode_var = tk.StringVar(value="sigma")
         self.sigma_k_var    = tk.DoubleVar(value=3.0)
@@ -151,17 +154,31 @@ class ATEReportApp:
 
         outer = ttk.Frame(root, padding=10)
         outer.grid(row=0, column=0, sticky="nsew")
-        outer.columnconfigure(0, weight=1)
-        # The log row should absorb extra vertical space.
-        outer.rowconfigure(6, weight=1)
+        # Left column = 1/3 (everything except plots); right column = 2/3 (plots).
+        outer.columnconfigure(0, weight=1, uniform="cols")
+        outer.columnconfigure(1, weight=2, uniform="cols")
+        outer.rowconfigure(0, weight=1)
 
-        self._build_input_row(outer, row=0)
-        self._build_preview(outer, row=1)
-        self._build_filters(outer, row=2)
-        self._build_plots(outer, row=3)
-        self._build_output(outer, row=4)
-        self._build_run_row(outer, row=5)
-        self._build_log(outer, row=6)
+        left = ttk.Frame(outer)
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        left.columnconfigure(0, weight=1)
+        # The log row absorbs extra vertical space.
+        left.rowconfigure(6, weight=1)
+
+        right = ttk.Frame(outer)
+        right.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+        right.columnconfigure(0, weight=1)
+        right.rowconfigure(0, weight=1)
+
+        self._build_input_row(left, row=0)
+        self._build_preview(left, row=1)
+        self._build_params_panel(left, row=2)
+        self._build_conditions_panel(left, row=3)
+        self._build_output(left, row=4)
+        self._build_run_row(left, row=5)
+        self._build_log(left, row=6)
+
+        self._build_plots(right, row=0)
 
     def _build_input_row(self, parent, row):
         frame = ttk.LabelFrame(parent, text="Input data folder", padding=8)
@@ -184,29 +201,28 @@ class ATEReportApp:
             text="No folder scanned yet.")
         self.preview_label.grid(row=0, column=0, sticky="ew")
 
-    def _build_filters(self, parent, row):
-        frame = ttk.Frame(parent)
+    def _build_params_panel(self, parent, row):
+        frame = ttk.LabelFrame(parent, text="Parameters", padding=8)
         frame.grid(row=row, column=0, sticky="ew", pady=(0, 8))
         frame.columnconfigure(0, weight=1)
-        frame.columnconfigure(1, weight=1)
-
-        pframe = ttk.LabelFrame(frame, text="Parameters", padding=8)
-        pframe.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
-        cframe = ttk.LabelFrame(frame, text="Conditions", padding=8)
-        cframe.grid(row=0, column=1, sticky="nsew", padx=(4, 0))
-
-        self.param_holder = ttk.Frame(pframe)
-        self.param_holder.grid(row=0, column=0, sticky="w")
-        self.cond_holder = ttk.Frame(cframe)
-        self.cond_holder.grid(row=0, column=0, sticky="w")
-
+        self.param_holder = ttk.Frame(frame)
+        self.param_holder.grid(row=0, column=0, sticky="ew")
         self._placeholder(self.param_holder, "scan a folder to list parameters")
+
+    def _build_conditions_panel(self, parent, row):
+        frame = ttk.LabelFrame(parent, text="Conditions", padding=8)
+        frame.grid(row=row, column=0, sticky="ew", pady=(0, 8))
+        frame.columnconfigure(0, weight=1)
+        self.cond_holder = ttk.Frame(frame)
+        self.cond_holder.grid(row=0, column=0, sticky="w")
         self._placeholder(self.cond_holder, "scan a folder to list conditions")
 
     def _build_plots(self, parent, row):
         frame = ttk.LabelFrame(parent, text="Plots", padding=8)
-        frame.grid(row=row, column=0, sticky="ew", pady=(0, 8))
+        frame.grid(row=row, column=0, sticky="nsew", pady=(0, 8))
         frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(1, weight=1)
+        self.plots_frame = frame
 
         # Shared controls: theme, image format, DPI — apply to every plot.
         sub = ttk.Frame(frame)
@@ -241,10 +257,21 @@ class ATEReportApp:
                        command=lambda k=key: self._popout_preview(k)).grid(
                 row=0, column=1, sticky="e")
 
-            preview_row = 1
+            title_row = ttk.Frame(tab)
+            title_row.grid(row=1, column=0, sticky="ew", pady=(4, 0))
+            title_row.columnconfigure(1, weight=1)
+            ttk.Label(title_row, text="Title:").grid(row=0, column=0, padx=(0, 4))
+            title_entry = ttk.Entry(title_row, textvariable=self.title_vars[key])
+            title_entry.grid(row=0, column=1, sticky="ew")
+            ttk.Label(title_row, text="(blank = parameter name)",
+                      foreground="#888888").grid(row=0, column=2, padx=(6, 0))
+            for evt in ("<Return>", "<FocusOut>"):
+                title_entry.bind(evt, lambda e: self._refresh_previews())
+
+            preview_row = 2
             if key == "boltzmann":
-                self._build_boltzmann_controls(tab, row=1)
-                preview_row = 2
+                self._build_boltzmann_controls(tab, row=2)
+                preview_row = 3
 
             preview = ttk.Label(tab, text="rendering preview…",
                                 anchor="center", relief="sunken",
@@ -319,11 +346,16 @@ class ATEReportApp:
         Per-parameter Y units from the Parameters panel win; the Boltzmann tab's
         Y-unit field acts as a global fallback (stored under the '*' key)."""
         mode = self.limit_mode_var.get()
+        title = self.title_vars["boltzmann"].get().strip()
         opts = {
             "limit_mode": mode,
             "sigma_k":    self._parse_float(self.sigma_k_var.get()) or 3.0,
             "show_table": bool(self.show_table_var.get()),
-            "show_title": False,
+            # Title behavior: blank entry => use the parameter name as the title
+            # (per-parameter); non-empty entry => use the entered text verbatim
+            # for every parameter.
+            "show_title": True,
+            "title":      title or None,
         }
         if mode == "fixed":
             opts["limits"] = (self._parse_float(self.limit_low_var.get()),
@@ -507,9 +539,10 @@ class ATEReportApp:
             ttk.Checkbutton(holder, text=name, variable=var).grid(
                 row=i // 3, column=i % 3, sticky="w", padx=(0, 12))
 
-    def _rebuild_param_rows(self, names, max_rows=7):
-        """Parameter list with a Y-unit entry per row, wrapped into columns of
-        at most ``max_rows`` so long parameter lists don't stretch the window."""
+    def _rebuild_param_rows(self, names, per_row=3):
+        """Parameter list wrapped row-major into ``per_row`` columns. Each cell
+        holds the checkbox + Y-unit entry. The first ``per_row`` parameters
+        fill row 1; the next group fills row 2; and so on."""
         holder = self.param_holder
         for child in holder.winfo_children():
             child.destroy()
@@ -519,27 +552,32 @@ class ATEReportApp:
             self._placeholder(holder, "none detected")
             return
 
-        for i, name in enumerate(names):
-            group = i // max_rows            # which column block
-            row_in = i % max_rows            # row within the block
-            base_col = group * 3             # 3 grid cols per block: chk, entry, gap
+        # Header strip — one "Parameter / Y unit" pair above each grid column.
+        for c in range(per_row):
+            base = c * 2
+            ttk.Label(holder, text="Parameter", foreground="#888888").grid(
+                row=0, column=base, sticky="w", padx=(0, 4))
+            ttk.Label(holder, text="Y unit", foreground="#888888").grid(
+                row=0, column=base + 1, sticky="w", padx=(0, 16))
 
-            if row_in == 0:                  # per-block header
-                ttk.Label(holder, text="Parameter", foreground="#888888").grid(
-                    row=0, column=base_col, sticky="w")
-                ttk.Label(holder, text="Y unit", foreground="#888888").grid(
-                    row=0, column=base_col + 1, sticky="w", padx=(8, 0))
+        for c in range(per_row):
+            holder.columnconfigure(c * 2,     weight=1)
+            holder.columnconfigure(c * 2 + 1, weight=0)
+
+        for i, name in enumerate(names):
+            r = (i // per_row) + 1           # data rows start at 1 (after header)
+            c = i % per_row
+            base = c * 2
 
             chk_var = tk.BooleanVar(value=True)
             self.param_vars[name] = chk_var
             ttk.Checkbutton(holder, text=name, variable=chk_var).grid(
-                row=row_in + 1, column=base_col, sticky="w")
+                row=r, column=base, sticky="w", padx=(0, 4), pady=1)
 
             unit_var = tk.StringVar(value=visualize.infer_unit(name))
             self.param_unit_vars[name] = unit_var
-            ttk.Entry(holder, textvariable=unit_var, width=6).grid(
-                row=row_in + 1, column=base_col + 1, sticky="w", padx=(8, 24),
-                pady=1)
+            ttk.Entry(holder, textvariable=unit_var, width=5).grid(
+                row=r, column=base + 1, sticky="w", padx=(0, 16), pady=1)
 
     # ── Run (background) ─────────────────────────────────────────────────────────
 

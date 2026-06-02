@@ -309,7 +309,8 @@ def _draw_value_table(ax_tbl, sub, order, palette, theme, unit, max_rows=30):
 
 def plot_boltzmann(df: pd.DataFrame, out_dir: str, fmt: str, dpi: int = 150,
                    theme=None, log=print, limit_mode="sigma", sigma_k=3.0,
-                   limits=None, units=None, show_title=False, show_table=True):
+                   limits=None, units=None, show_title=False, show_table=True,
+                   title=None):
     """
     One scatter strip per temp condition, x-axis is Temperature (°C).
 
@@ -318,7 +319,9 @@ def plot_boltzmann(df: pd.DataFrame, out_dir: str, fmt: str, dpi: int = 150,
     sigma_k    : multiplier for the "sigma" mode.
     limits     : for "fixed" mode — (low, high) or {param: (low, high)} / {"*": ...}.
     units      : y-axis unit — str (all), {param: unit}, or None to infer.
-    show_title : draw the "Boltzmann Scatter — <param>" title (default off).
+    show_title : draw a title on the plot.
+    title      : when show_title is True, this string is used verbatim for every
+                 parameter; if None the parameter name is used as the title.
     show_table : render the per-unit value table to the right of the plot.
     """
     t = get_theme(theme)
@@ -369,7 +372,7 @@ def plot_boltzmann(df: pd.DataFrame, out_dir: str, fmt: str, dpi: int = 150,
         ylabel = f"{param}\n({unit})" if unit else f"{param}\n(extracted value)"
         ax.set_ylabel(ylabel, fontsize=10)
         if show_title:
-            ax.set_title(f"Boltzmann Scatter — {param}", fontsize=12, pad=10)
+            ax.set_title(title if title else param, fontsize=12, pad=10)
 
         # X-axis: show only the temp positions present
         used_temps = sorted(sub["temp_cond"].unique(),
@@ -713,7 +716,11 @@ def main():
     )
     parser.add_argument(
         "--show-title", action="store_true",
-        help="Show the 'Boltzmann Scatter — …' title (hidden by default)"
+        help="Show a title on the Boltzmann plot (defaults to the parameter name)"
+    )
+    parser.add_argument(
+        "--title", default=None,
+        help="Custom Boltzmann title (implies --show-title; applies to every parameter)"
     )
     parser.add_argument(
         "--plots", default="all",
@@ -758,7 +765,8 @@ def main():
                       if args.limit_mode == "fixed" else None,
         "units":      units_arg,
         "show_table": not args.no_table,
-        "show_title": args.show_title,
+        "show_title": args.show_title or bool(args.title),
+        "title":      args.title,
     }
     generate_plots(df, requested, args.output_dir, args.format,
                    dpi=args.dpi, theme=args.theme,
