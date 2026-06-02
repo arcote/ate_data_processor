@@ -29,14 +29,17 @@ import matplotlib
 matplotlib.use("Agg")
 
 import queue
+import tempfile
 import threading
 import traceback
 from pathlib import Path
 
+import numpy as np
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 import pandas as pd
+from PIL import Image, ImageTk
 
 import extract_ate_data as extract
 import visualize_ate_data as visualize
@@ -50,8 +53,35 @@ PLOT_LABELS = {
     "heatmap":   "Heat map",
     "histogram": "Histogram overlay",
 }
+PLOT_FILE = {
+    "boltzmann": "1_boltzmann_Demo.png",
+    "box":       "2_boxplot.png",
+    "trend":     "3_run_trend.png",
+    "heatmap":   "4_heatmap.png",
+    "histogram": "5_histogram.png",
+}
 IMAGE_FORMATS = ["png", "pdf", "svg"]
+THEMES = sorted(visualize.THEMES)
 BASE_COLS = ["test_folder", "temp_folder", "run_number", "extracted_value"]
+
+
+def make_demo_dataframe():
+    """Synthetic dataset used to render the plot previews — covers all five
+    plots cleanly (1 parameter × 3 conditions × 3 iterations × 8 runs)."""
+    rng = np.random.default_rng(0)
+    rows = []
+    centers = {"COLD": 1.0e-9, "ROOM": 2.0e-9, "HOT": 5.0e-9}
+    for test in ("1st test", "2nd test", "3rd test"):
+        for cond, c in centers.items():
+            for run in range(1, 9):
+                val = c * (1 + rng.uniform(-0.08, 0.08))
+                rows.append({
+                    "test_folder": test,
+                    "temp_folder": f"Demo_{cond}",
+                    "run_number": run,
+                    "extracted_value": val,
+                })
+    return pd.DataFrame(rows)
 
 
 class ATEReportApp:
@@ -83,9 +113,20 @@ class ATEReportApp:
 
         self.img_format_var = tk.StringVar(value="png")
         self.dpi_var        = tk.IntVar(value=150)
+        self.theme_var      = tk.StringVar(value=visualize.DEFAULT_THEME)
+        self.theme_var.trace_add("write", lambda *_: self._refresh_previews())
+
+        # Preview state — holds the rendered PhotoImage refs so Tk doesn't
+        # garbage-collect them, the cached demo DataFrame, and a temp dir.
+        self._preview_dir = Path(tempfile.mkdtemp(prefix="ate_preview_"))
+        self._preview_df = make_demo_dataframe()
+        self._preview_images = {}      # plot_key -> ImageTk.PhotoImage
+        self._preview_labels = {}      # plot_key -> ttk.Label
+        self._preview_thread = None
 
         self._build_ui()
         self.root.after(100, self._drain_queue)
+        self.root.after(50, self._refresh_previews)
 
     # ── UI construction ──────────────────────────────────────────────────────
 
@@ -151,21 +192,79 @@ class ATEReportApp:
     def _build_plots(self, parent, row):
         frame = ttk.LabelFrame(parent, text="Plots", padding=8)
         frame.grid(row=row, column=0, sticky="ew", pady=(0, 8))
+        frame.columnconfigure(0, weight=1)
 
-        toggles = ttk.Frame(frame)
-        toggles.grid(row=0, column=0, sticky="w")
-        for i, (key, label) in enumerate(PLOT_LABELS.items()):
-            ttk.Checkbutton(toggles, text=label, variable=self.plot_vars[key]).grid(
-                row=0, column=i, sticky="w", padx=(0, 12))
-
+        # Shared controls: theme, image format, DPI — apply to every plot.
         sub = ttk.Frame(frame)
-        sub.grid(row=1, column=0, sticky="w", pady=(8, 0))
-        ttk.Label(sub, text="Image format:").grid(row=0, column=0, padx=(0, 4))
+        sub.grid(row=0, column=0, sticky="w", pady=(0, 6))
+        ttk.Label(sub, text="Theme:").grid(row=0, column=0, padx=(0, 4))
+        ttk.Combobox(sub, textvariable=self.theme_var, values=THEMES,
+                     width=8, state="readonly").grid(row=0, column=1, padx=(0, 16))
+        ttk.Label(sub, text="Image format:").grid(row=0, column=2, padx=(0, 4))
         ttk.Combobox(sub, textvariable=self.img_format_var, values=IMAGE_FORMATS,
-                     width=6, state="readonly").grid(row=0, column=1, padx=(0, 16))
-        ttk.Label(sub, text="DPI:").grid(row=0, column=2, padx=(0, 4))
+                     width=6, state="readonly").grid(row=0, column=3, padx=(0, 16))
+        ttk.Label(sub, text="DPI:").grid(row=0, column=4, padx=(0, 4))
         ttk.Spinbox(sub, from_=72, to=600, increment=1, width=6,
-                    textvariable=self.dpi_var).grid(row=0, column=3)
+                    textvariable=self.dpi_var).grid(row=0, column=5)
+
+        # One tab per plot type. Each tab holds an enable checkbox and a
+        # theme-aware preview thumbnail. Future per-plot adjustment controls
+        # belong inside these tab frames.
+        nb = ttk.Notebook(frame)
+        nb.grid(row=1, column=0, sticky="nsew")
+        for key, label in PLOT_LABELS.items():
+            tab = ttk.Frame(nb, padding=8)
+            nb.add(tab, text=label)
+            tab.columnconfigure(0, weight=1)
+
+            top = ttk.Frame(tab)
+            top.grid(row=0, column=0, sticky="ew")
+            ttk.Checkbutton(top, text=f"Include {label}",
+                            variable=self.plot_vars[key]).grid(
+                row=0, column=0, sticky="w")
+            ttk.Label(top, text="(more adjustments coming)",
+                      foreground="#888888").grid(row=0, column=1, sticky="w",
+                                                  padx=(12, 0))
+
+            preview = ttk.Label(tab, text="rendering preview…",
+                                anchor="center", relief="sunken",
+                                background="#f0f0f0")
+            preview.grid(row=1, column=0, sticky="nsew", pady=(8, 0))
+            tab.rowconfigure(1, weight=1)
+            self._preview_labels[key] = preview
+
+    # ── Preview rendering ────────────────────────────────────────────────────────
+
+    def _refresh_previews(self):
+        """Re-render the per-tab plot previews from the synthetic demo dataset
+        using the currently selected theme. Runs on a background thread so the
+        UI stays responsive."""
+        if self._preview_thread is not None and self._preview_thread.is_alive():
+            return
+        theme_name = self.theme_var.get()
+        for lbl in self._preview_labels.values():
+            lbl.configure(text=f"rendering ({theme_name}) preview…", image="")
+        self._preview_thread = threading.Thread(
+            target=self._render_previews_worker, args=(theme_name,), daemon=True)
+        self._preview_thread.start()
+
+    def _render_previews_worker(self, theme_name):
+        try:
+            preview_df = visualize.enrich(self._preview_df)
+            preview_df = preview_df.rename(columns={"parameter": "parameter"})
+            # The Boltzmann plot names its file after the parameter; the demo
+            # dataset uses a single parameter named "Demo".
+            visualize.generate_plots(
+                preview_df, list(PLOT_LABELS), str(self._preview_dir),
+                fmt="png", dpi=80, theme=theme_name, log=lambda *_: None)
+            for key, fname in PLOT_FILE.items():
+                path = self._preview_dir / fname
+                if path.exists():
+                    self._post("preview_image", (key, str(path)))
+                else:
+                    self._post("preview_missing", key)
+        except Exception:
+            self._post("error", traceback.format_exc())
 
     def _build_output(self, parent, row):
         frame = ttk.LabelFrame(parent, text="Output", padding=8)
@@ -366,6 +465,7 @@ class ATEReportApp:
             "conds": set(conds),
             "img_format": self.img_format_var.get(),
             "dpi": int(self.dpi_var.get()),
+            "theme": self.theme_var.get(),
         }
 
     def _run_worker(self, cfg):
@@ -447,7 +547,8 @@ class ATEReportApp:
             plot_dir.mkdir(parents=True, exist_ok=True)
             visualize.generate_plots(
                 df, cfg["plots"], str(plot_dir),
-                fmt=cfg["img_format"], dpi=cfg["dpi"], log=log,
+                fmt=cfg["img_format"], dpi=cfg["dpi"],
+                theme=cfg["theme"], log=log,
                 progress_callback=phase_progress(step))
             written.append(str(plot_dir))
             base[0] += step
@@ -487,6 +588,12 @@ class ATEReportApp:
                     self._set_status(payload)
                 elif kind == "preview":
                     self._apply_preview(payload)
+                elif kind == "preview_image":
+                    self._set_preview_image(*payload)
+                elif kind == "preview_missing":
+                    lbl = self._preview_labels.get(payload)
+                    if lbl is not None:
+                        lbl.configure(image="", text="(no preview)")
                 elif kind == "done":
                     self._set_status("Done.")
                     self.run_button.configure(state="normal")
@@ -499,6 +606,24 @@ class ATEReportApp:
         except queue.Empty:
             pass
         self.root.after(100, self._drain_queue)
+
+    def _set_preview_image(self, key, path):
+        """Load a preview PNG, scale to fit the tab, and display it."""
+        lbl = self._preview_labels.get(key)
+        if lbl is None:
+            return
+        try:
+            img = Image.open(path)
+        except Exception:
+            lbl.configure(image="", text="(preview unavailable)")
+            return
+        # Scale so the longer side fits the available preview height.
+        max_w = max(lbl.winfo_width()  or 700, 400)
+        max_h = max(lbl.winfo_height() or 260, 200)
+        img.thumbnail((max_w, max_h), Image.LANCZOS)
+        photo = ImageTk.PhotoImage(img)
+        self._preview_images[key] = photo   # keep ref
+        lbl.configure(image=photo, text="")
 
     # ── Small helpers ────────────────────────────────────────────────────────────
 

@@ -58,6 +58,65 @@ TEMP_AXIS_MAP = {
 VALUE_COL = "extracted_value"
 
 
+# ── Themes ───────────────────────────────────────────────────────────────────
+# A theme bundles every colour the plots use so the whole report can be
+# switched between a light and a dark presentation. ``temp_palette`` is the
+# per-condition series colour and falls back to ``default_color``.
+
+THEMES = {
+    "light": {
+        "fig_face":     "#ffffff",
+        "axes_face":    "#f7f8fc",
+        "axes_edge":    "#cccccc",
+        "text":         "#222222",
+        "label":        "#222222",
+        "title":        "#111111",
+        "grid":         "#e0e0e0",
+        "tick":         "#444444",
+        "legend_face":  "#ffffff",
+        "legend_edge":  "#cccccc",
+        "median":       "#222222",
+        "whisker":      "#8891aa",
+        "heatmap_cmap": "YlOrRd",
+        "heatmap_line": "#ffffff",
+        "temp_palette": TEMP_PALETTE,
+        "default_color": DEFAULT_COLOR,
+    },
+    "dark": {
+        "fig_face":     "#0f1117",
+        "axes_face":    "#1a1d28",
+        "axes_edge":    "#3a3f4f",
+        "text":         "#e6e6e6",
+        "label":        "#dddddd",
+        "title":        "#ffffff",
+        "grid":         "#2a2e3a",
+        "tick":         "#bbbbbb",
+        "legend_face":  "#1a1d28",
+        "legend_edge":  "#3a3f4f",
+        "median":       "#ffffff",
+        "whisker":      "#aab1c4",
+        "heatmap_cmap": "magma",
+        "heatmap_line": "#0f1117",
+        "temp_palette": {"COLD": "#5fa8ff", "ROOM": "#ff6fc8", "HOT": "#34d4be"},
+        "default_color": "#bbbbbb",
+    },
+}
+DEFAULT_THEME = "light"
+
+
+def get_theme(theme):
+    """Resolve ``theme`` (a name or a custom dict) to a theme dict."""
+    if isinstance(theme, dict):
+        return theme
+    if theme is None:
+        return THEMES[DEFAULT_THEME]
+    try:
+        return THEMES[theme]
+    except KeyError:
+        raise ValueError(f"Unknown theme {theme!r}. "
+                         f"Choices: {sorted(THEMES)}")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
@@ -112,30 +171,33 @@ def load_and_enrich(csv_path: str) -> pd.DataFrame:
         sys.exit(f"[ERROR] {exc}")
 
 
-def save_fig(fig, out_dir: str, name: str, fmt: str, dpi: int = 150, log=print):
+def save_fig(fig, out_dir: str, name: str, fmt: str, dpi: int = 150,
+             facecolor: str = "#ffffff", log=print):
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, f"{name}.{fmt}")
-    fig.savefig(path, dpi=dpi, bbox_inches="tight", facecolor="#ffffff")
+    fig.savefig(path, dpi=dpi, bbox_inches="tight", facecolor=facecolor)
     log(f"  Saved → {path}")
     return path
 
 
-def apply_base_style():
+def apply_base_style(theme=None):
+    """Update matplotlib rcParams from a theme dict (or a theme name)."""
+    t = get_theme(theme)
     plt.rcParams.update({
-        "figure.facecolor":  "#ffffff",
-        "axes.facecolor":    "#f7f8fc",
-        "axes.edgecolor":    "#cccccc",
-        "axes.labelcolor":   "#222222",
-        "axes.titlecolor":   "#111111",
+        "figure.facecolor":  t["fig_face"],
+        "axes.facecolor":    t["axes_face"],
+        "axes.edgecolor":    t["axes_edge"],
+        "axes.labelcolor":   t["label"],
+        "axes.titlecolor":   t["title"],
         "axes.grid":         True,
-        "grid.color":        "#e0e0e0",
+        "grid.color":        t["grid"],
         "grid.linewidth":    0.7,
-        "xtick.color":       "#444444",
-        "ytick.color":       "#444444",
-        "text.color":        "#222222",
-        "legend.facecolor":  "#ffffff",
-        "legend.edgecolor":  "#cccccc",
-        "legend.labelcolor": "#222222",
+        "xtick.color":       t["tick"],
+        "ytick.color":       t["tick"],
+        "text.color":        t["text"],
+        "legend.facecolor":  t["legend_face"],
+        "legend.edgecolor":  t["legend_edge"],
+        "legend.labelcolor": t["text"],
         "font.family":       "monospace",
         "font.size":         9,
     })
@@ -145,30 +207,30 @@ def apply_base_style():
 # Plot 1 — Boltzmann Scatter (reference format)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def plot_boltzmann(df: pd.DataFrame, out_dir: str, fmt: str, dpi: int = 150, log=print):
+def plot_boltzmann(df: pd.DataFrame, out_dir: str, fmt: str, dpi: int = 150,
+                   theme=None, log=print):
     """One scatter strip per temp condition, x-axis is temperature (°C)."""
+    t = get_theme(theme)
+    palette = t["temp_palette"]
     params = df["parameter"].unique()
 
     for param in params:
         sub = df[df["parameter"] == param].copy()
 
         fig, ax = plt.subplots(figsize=(10, 4.5))
-        fig.patch.set_facecolor("#0f1117")
+        fig.patch.set_facecolor(t["fig_face"])
 
         jitter = 1.2   # x-axis spread for visual separation of overlapping dots
 
         for cond, grp in sub.groupby("temp_cond"):
             x_base = TEMP_AXIS_MAP.get(cond, 25)
-            x_jitter = grp["run_number"].rank(method="first") * 0 + x_base  # no jitter unless needed
             # Light horizontal jitter so overlapping points separate
-            import numpy as np
-            rng = len(grp)
             x_jitter = x_base + (grp["run_number"].values - grp["run_number"].mean()) / max(grp["run_number"].std() or 1, 1) * jitter
 
             ax.scatter(
                 x_jitter,
                 grp[VALUE_COL],
-                c=TEMP_PALETTE.get(cond, DEFAULT_COLOR),
+                c=palette.get(cond, t["default_color"]),
                 alpha=0.75,
                 s=28,
                 zorder=3,
@@ -191,7 +253,8 @@ def plot_boltzmann(df: pd.DataFrame, out_dir: str, fmt: str, dpi: int = 150, log
         ax.legend(by_label.values(), by_label.keys(), loc="upper left")
 
         fig.tight_layout()
-        save_fig(fig, out_dir, f"1_boltzmann_{param}", fmt, dpi=dpi, log=log)
+        save_fig(fig, out_dir, f"1_boltzmann_{param}", fmt, dpi=dpi,
+                 facecolor=t["fig_face"], log=log)
         plt.close(fig)
 
 
@@ -199,15 +262,18 @@ def plot_boltzmann(df: pd.DataFrame, out_dir: str, fmt: str, dpi: int = 150, log
 # Plot 2 — Box-and-Whisker
 # ─────────────────────────────────────────────────────────────────────────────
 
-def plot_boxplot(df: pd.DataFrame, out_dir: str, fmt: str, dpi: int = 150, log=print):
+def plot_boxplot(df: pd.DataFrame, out_dir: str, fmt: str, dpi: int = 150,
+                 theme=None, log=print):
     """Distribution spread per parameter × temperature condition."""
+    t = get_theme(theme)
+    palette = t["temp_palette"]
     params = df["parameter"].unique()
     n = len(params)
     ncols = min(3, n)
     nrows = (n + ncols - 1) // ncols
 
     fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 4.5 * nrows), squeeze=False)
-    fig.patch.set_facecolor("#0f1117")
+    fig.patch.set_facecolor(t["fig_face"])
     fig.suptitle("Box-and-Whisker: Value Distribution per Condition", fontsize=13, y=1.01)
 
     for idx, param in enumerate(params):
@@ -215,16 +281,16 @@ def plot_boxplot(df: pd.DataFrame, out_dir: str, fmt: str, dpi: int = 150, log=p
         sub = df[df["parameter"] == param]
 
         order  = [c for c in ("COLD", "ROOM", "HOT") if c in sub["temp_cond"].unique()]
-        colors = [TEMP_PALETTE.get(c, DEFAULT_COLOR) for c in order]
+        colors = [palette.get(c, t["default_color"]) for c in order]
 
         bp = ax.boxplot(
             [sub[sub["temp_cond"] == c][VALUE_COL].values for c in order],
             patch_artist=True,
             notch=False,
             widths=0.45,
-            medianprops=dict(color="#ffffff", linewidth=1.8),
-            whiskerprops=dict(color="#8891aa"),
-            capprops=dict(color="#8891aa"),
+            medianprops=dict(color=t["median"], linewidth=1.8),
+            whiskerprops=dict(color=t["whisker"]),
+            capprops=dict(color=t["whisker"]),
             flierprops=dict(marker="o", markersize=3, alpha=0.5),
         )
         for patch, color in zip(bp["boxes"], colors):
@@ -243,7 +309,8 @@ def plot_boxplot(df: pd.DataFrame, out_dir: str, fmt: str, dpi: int = 150, log=p
         axes[idx // ncols][idx % ncols].set_visible(False)
 
     fig.tight_layout()
-    save_fig(fig, out_dir, "2_boxplot", fmt, dpi=dpi, log=log)
+    save_fig(fig, out_dir, "2_boxplot", fmt, dpi=dpi,
+             facecolor=t["fig_face"], log=log)
     plt.close(fig)
 
 
@@ -251,15 +318,18 @@ def plot_boxplot(df: pd.DataFrame, out_dir: str, fmt: str, dpi: int = 150, log=p
 # Plot 3 — Run Trend (stability / drift check)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def plot_run_trend(df: pd.DataFrame, out_dir: str, fmt: str, dpi: int = 150, log=print):
+def plot_run_trend(df: pd.DataFrame, out_dir: str, fmt: str, dpi: int = 150,
+                   theme=None, log=print):
     """Value vs. run number — reveals drift, outliers, repeatability issues."""
+    t = get_theme(theme)
+    palette = t["temp_palette"]
     params = df["parameter"].unique()
     n = len(params)
     ncols = min(2, n)
     nrows = (n + ncols - 1) // ncols
 
     fig, axes = plt.subplots(nrows, ncols, figsize=(7 * ncols, 4 * nrows), squeeze=False)
-    fig.patch.set_facecolor("#0f1117")
+    fig.patch.set_facecolor(t["fig_face"])
     fig.suptitle("Run Trend: Value vs. Run Number (Drift / Stability)", fontsize=13, y=1.01)
 
     for idx, param in enumerate(params):
@@ -268,7 +338,7 @@ def plot_run_trend(df: pd.DataFrame, out_dir: str, fmt: str, dpi: int = 150, log
 
         for cond, grp in sub.groupby("temp_cond"):
             grp_s = grp.sort_values("run_number")
-            color = TEMP_PALETTE.get(cond, DEFAULT_COLOR)
+            color = palette.get(cond, t["default_color"])
             ax.plot(
                 grp_s["run_number"], grp_s[VALUE_COL],
                 marker="o", ms=5, lw=1.4,
@@ -290,7 +360,8 @@ def plot_run_trend(df: pd.DataFrame, out_dir: str, fmt: str, dpi: int = 150, log
         axes[idx // ncols][idx % ncols].set_visible(False)
 
     fig.tight_layout()
-    save_fig(fig, out_dir, "3_run_trend", fmt, dpi=dpi, log=log)
+    save_fig(fig, out_dir, "3_run_trend", fmt, dpi=dpi,
+             facecolor=t["fig_face"], log=log)
     plt.close(fig)
 
 
@@ -298,12 +369,15 @@ def plot_run_trend(df: pd.DataFrame, out_dir: str, fmt: str, dpi: int = 150, log
 # Plot 4 — Heat Map (mean value grid)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def plot_heatmap(df: pd.DataFrame, out_dir: str, fmt: str, dpi: int = 150, log=print):
+def plot_heatmap(df: pd.DataFrame, out_dir: str, fmt: str, dpi: int = 150,
+                 theme=None, log=print):
     """
     Mean extracted value as a colour grid: rows = parameter×condition,
     columns = test iteration (3rd/4th/5th test).
     Good for spotting lot-to-lot or iteration-to-iteration shifts.
     """
+    t = get_theme(theme)
+    df = df.copy()
     df["param_cond"] = df["parameter"] + " | " + df["temp_cond"]
     pivot = df.pivot_table(
         index="param_cond",
@@ -317,16 +391,16 @@ def plot_heatmap(df: pd.DataFrame, out_dir: str, fmt: str, dpi: int = 150, log=p
         return
 
     fig, ax = plt.subplots(figsize=(max(6, len(pivot.columns) * 2.2), max(4, len(pivot) * 0.55 + 1.5)))
-    fig.patch.set_facecolor("#0f1117")
+    fig.patch.set_facecolor(t["fig_face"])
 
     sns.heatmap(
         pivot,
         ax=ax,
-        cmap="YlOrRd",
+        cmap=t["heatmap_cmap"],
         annot=True,
         fmt=".3g",
         linewidths=0.4,
-        linecolor="#0f1117",
+        linecolor=t["heatmap_line"],
         cbar_kws={"shrink": 0.7, "label": "Mean Value"},
     )
 
@@ -337,7 +411,8 @@ def plot_heatmap(df: pd.DataFrame, out_dir: str, fmt: str, dpi: int = 150, log=p
     ax.tick_params(axis="y", rotation=0)
 
     fig.tight_layout()
-    save_fig(fig, out_dir, "4_heatmap", fmt, dpi=dpi, log=log)
+    save_fig(fig, out_dir, "4_heatmap", fmt, dpi=dpi,
+             facecolor=t["fig_face"], log=log)
     plt.close(fig)
 
 
@@ -345,15 +420,18 @@ def plot_heatmap(df: pd.DataFrame, out_dir: str, fmt: str, dpi: int = 150, log=p
 # Plot 5 — Histogram Overlay
 # ─────────────────────────────────────────────────────────────────────────────
 
-def plot_histograms(df: pd.DataFrame, out_dir: str, fmt: str, dpi: int = 150, log=print):
+def plot_histograms(df: pd.DataFrame, out_dir: str, fmt: str, dpi: int = 150,
+                    theme=None, log=print):
     """Overlaid histograms per temp condition — shows distribution shape."""
+    t = get_theme(theme)
+    palette = t["temp_palette"]
     params = df["parameter"].unique()
     n = len(params)
     ncols = min(2, n)
     nrows = (n + ncols - 1) // ncols
 
     fig, axes = plt.subplots(nrows, ncols, figsize=(6.5 * ncols, 4 * nrows), squeeze=False)
-    fig.patch.set_facecolor("#0f1117")
+    fig.patch.set_facecolor(t["fig_face"])
     fig.suptitle("Histogram Overlay: Value Distribution per Temp Condition", fontsize=13, y=1.01)
 
     for idx, param in enumerate(params):
@@ -365,7 +443,7 @@ def plot_histograms(df: pd.DataFrame, out_dir: str, fmt: str, dpi: int = 150, lo
             grp = sub[sub["temp_cond"] == cond][VALUE_COL].dropna()
             if grp.empty:
                 continue
-            color = TEMP_PALETTE.get(cond, DEFAULT_COLOR)
+            color = palette.get(cond, t["default_color"])
             ax.hist(
                 grp, bins=bins,
                 color=color, alpha=0.55,
@@ -384,7 +462,8 @@ def plot_histograms(df: pd.DataFrame, out_dir: str, fmt: str, dpi: int = 150, lo
         axes[idx // ncols][idx % ncols].set_visible(False)
 
     fig.tight_layout()
-    save_fig(fig, out_dir, "5_histogram", fmt, dpi=dpi, log=log)
+    save_fig(fig, out_dir, "5_histogram", fmt, dpi=dpi,
+             facecolor=t["fig_face"], log=log)
     plt.close(fig)
 
 
@@ -403,21 +482,23 @@ _PLOT_FUNCS = {
 }
 
 
-def generate_plots(df, plots, out_dir, fmt="png", dpi=150, log=print,
-                   progress_callback=None):
+def generate_plots(df, plots, out_dir, fmt="png", dpi=150, theme=None,
+                   log=print, progress_callback=None):
     """
     Generate the requested plots from an enriched DataFrame.
 
     plots: iterable of names from ALL_PLOTS.
+    theme: a name in THEMES (e.g. "light", "dark") or a custom theme dict.
     Applies the base style, then runs each selected plot. progress_callback(
     done, total) fires after each plot type. Returns the list of plots run.
     """
-    apply_base_style()
+    t = get_theme(theme)
+    apply_base_style(t)
     selected = [p for p in ALL_PLOTS if p in set(plots)]
     total = len(selected)
     for i, name in enumerate(selected, 1):
         log(f"[{i}/{total}] {name}...")
-        _PLOT_FUNCS[name](df, out_dir, fmt, dpi=dpi, log=log)
+        _PLOT_FUNCS[name](df, out_dir, fmt, dpi=dpi, theme=t, log=log)
         if progress_callback is not None:
             progress_callback(i, total)
     return selected
@@ -448,6 +529,10 @@ def main():
         help="Output resolution for raster formats (default: 150)"
     )
     parser.add_argument(
+        "--theme", default=DEFAULT_THEME, choices=sorted(THEMES),
+        help=f"Color theme for the plots (default: {DEFAULT_THEME})"
+    )
+    parser.add_argument(
         "--plots", default="all",
         help=(
             "Comma-separated list of plots to generate: "
@@ -468,7 +553,8 @@ def main():
         else [p.strip().lower() for p in args.plots.split(",")]
     )
 
-    generate_plots(df, requested, args.output_dir, args.format, dpi=args.dpi)
+    generate_plots(df, requested, args.output_dir, args.format,
+                   dpi=args.dpi, theme=args.theme)
 
     print("\nAll done.")
 
