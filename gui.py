@@ -131,9 +131,12 @@ class ATEReportApp:
         # garbage-collect them, the cached demo DataFrame, and a temp dir.
         self._preview_dir = Path(tempfile.mkdtemp(prefix="ate_preview_"))
         self._preview_df = make_demo_dataframe()
-        self._preview_images = {}      # plot_key -> ImageTk.PhotoImage
+        self._preview_images = {}      # plot_key -> ImageTk.PhotoImage (shown)
+        self._preview_src    = {}      # plot_key -> PIL.Image (full-res source)
         self._preview_labels = {}      # plot_key -> ttk.Label
+        self._preview_size   = {}      # plot_key -> last rendered (w, h)
         self._preview_thread = None
+        self._popouts        = []      # live Toplevel pop-out windows
 
         self._build_ui()
         self.root.after(100, self._drain_queue)
@@ -230,9 +233,13 @@ class ATEReportApp:
 
             top = ttk.Frame(tab)
             top.grid(row=0, column=0, sticky="ew")
+            top.columnconfigure(0, weight=1)
             ttk.Checkbutton(top, text=f"Include {label}",
                             variable=self.plot_vars[key]).grid(
                 row=0, column=0, sticky="w")
+            ttk.Button(top, text="Pop out ⤢", width=10,
+                       command=lambda k=key: self._popout_preview(k)).grid(
+                row=0, column=1, sticky="e")
 
             preview_row = 1
             if key == "boltzmann":
@@ -243,6 +250,10 @@ class ATEReportApp:
                                 anchor="center", relief="sunken",
                                 background="#f0f0f0")
             preview.grid(row=preview_row, column=0, sticky="nsew", pady=(8, 0))
+            preview.bind("<Configure>",
+                         lambda e, k=key: self._on_preview_configure(k, e))
+            preview.bind("<Double-Button-1>",
+                         lambda e, k=key: self._popout_preview(k))
             tab.rowconfigure(preview_row, weight=1)
             self._preview_labels[key] = preview
 
@@ -496,8 +507,9 @@ class ATEReportApp:
             ttk.Checkbutton(holder, text=name, variable=var).grid(
                 row=i // 3, column=i % 3, sticky="w", padx=(0, 12))
 
-    def _rebuild_param_rows(self, names):
-        """Parameter list with a Y-unit entry per row (inferred default, editable)."""
+    def _rebuild_param_rows(self, names, max_rows=7):
+        """Parameter list with a Y-unit entry per row, wrapped into columns of
+        at most ``max_rows`` so long parameter lists don't stretch the window."""
         holder = self.param_holder
         for child in holder.winfo_children():
             child.destroy()
@@ -507,20 +519,27 @@ class ATEReportApp:
             self._placeholder(holder, "none detected")
             return
 
-        ttk.Label(holder, text="Parameter",
-                  foreground="#888888").grid(row=0, column=0, sticky="w")
-        ttk.Label(holder, text="Y unit",
-                  foreground="#888888").grid(row=0, column=1, sticky="w", padx=(8, 0))
-        for i, name in enumerate(names, start=1):
+        for i, name in enumerate(names):
+            group = i // max_rows            # which column block
+            row_in = i % max_rows            # row within the block
+            base_col = group * 3             # 3 grid cols per block: chk, entry, gap
+
+            if row_in == 0:                  # per-block header
+                ttk.Label(holder, text="Parameter", foreground="#888888").grid(
+                    row=0, column=base_col, sticky="w")
+                ttk.Label(holder, text="Y unit", foreground="#888888").grid(
+                    row=0, column=base_col + 1, sticky="w", padx=(8, 0))
+
             chk_var = tk.BooleanVar(value=True)
             self.param_vars[name] = chk_var
             ttk.Checkbutton(holder, text=name, variable=chk_var).grid(
-                row=i, column=0, sticky="w")
+                row=row_in + 1, column=base_col, sticky="w")
 
             unit_var = tk.StringVar(value=visualize.infer_unit(name))
             self.param_unit_vars[name] = unit_var
             ttk.Entry(holder, textvariable=unit_var, width=6).grid(
-                row=i, column=1, sticky="w", padx=(8, 0), pady=1)
+                row=row_in + 1, column=base_col + 1, sticky="w", padx=(8, 24),
+                pady=1)
 
     # ── Run (background) ─────────────────────────────────────────────────────────
 
@@ -731,22 +750,75 @@ class ATEReportApp:
         self.root.after(100, self._drain_queue)
 
     def _set_preview_image(self, key, path):
-        """Load a preview PNG, scale to fit the tab, and display it."""
+        """Load a freshly-rendered preview PNG, cache the source, and display
+        it scaled to the current tab size."""
         lbl = self._preview_labels.get(key)
         if lbl is None:
             return
         try:
-            img = Image.open(path)
+            src = Image.open(path).copy()
         except Exception:
             lbl.configure(image="", text="(preview unavailable)")
             return
-        # Scale so the longer side fits the available preview height.
-        max_w = max(lbl.winfo_width()  or 700, 400)
-        max_h = max(lbl.winfo_height() or 260, 200)
-        img.thumbnail((max_w, max_h), Image.LANCZOS)
+        self._preview_src[key] = src
+        self._preview_size[key] = None      # force a re-fit
+        self._fit_preview(key)
+
+    def _fit_preview(self, key):
+        """Scale the cached source image to the label's current size."""
+        lbl = self._preview_labels.get(key)
+        src = self._preview_src.get(key)
+        if lbl is None or src is None:
+            return
+        w = max(lbl.winfo_width()  - 8, 200)
+        h = max(lbl.winfo_height() - 8, 150)
+        if self._preview_size.get(key) == (w, h):
+            return                          # already at this size — avoid churn
+        self._preview_size[key] = (w, h)
+        img = src.copy()
+        img.thumbnail((w, h), Image.LANCZOS)
         photo = ImageTk.PhotoImage(img)
         self._preview_images[key] = photo   # keep ref
         lbl.configure(image=photo, text="")
+
+    def _on_preview_configure(self, key, event):
+        """Rescale the preview when its tab/label is resized."""
+        if self._preview_src.get(key) is None:
+            return
+        last = self._preview_size.get(key)
+        if last and abs(event.width - 8 - last[0]) < 4 and \
+                    abs(event.height - 8 - last[1]) < 4:
+            return
+        self._fit_preview(key)
+
+    def _popout_preview(self, key):
+        """Open a resizable window showing the full preview for this plot."""
+        src = self._preview_src.get(key)
+        if src is None:
+            messagebox.showinfo("Preview", "No preview rendered yet.")
+            return
+        top = tk.Toplevel(self.root)
+        top.title(f"{PLOT_LABELS.get(key, key)} — preview")
+        top.geometry("960x600")
+        lbl = ttk.Label(top, anchor="center", background="#ffffff")
+        lbl.pack(fill="both", expand=True)
+        state = {"photo": None, "size": None}
+
+        def render(w, h):
+            w, h = max(w - 12, 200), max(h - 12, 150)
+            if state["size"] == (w, h):
+                return
+            state["size"] = (w, h)
+            img = src.copy()
+            img.thumbnail((w, h), Image.LANCZOS)
+            state["photo"] = ImageTk.PhotoImage(img)
+            lbl.configure(image=state["photo"])
+
+        lbl.bind("<Configure>", lambda e: render(e.width, e.height))
+        self._popouts.append(top)
+        top.protocol("WM_DELETE_WINDOW",
+                     lambda: (self._popouts.remove(top) if top in self._popouts
+                              else None, top.destroy()))
 
     # ── Small helpers ────────────────────────────────────────────────────────────
 
